@@ -336,45 +336,117 @@ function compareVersions(a, b) {
  * @param {boolean} force - 忽略缓存
  * @returns {Promise<object>} 检查结果
  */
-async function checkUpdate(force) {
-  const now = Date.now();
-  if (!force && updateCache.data && now - updateCache.at < UPDATE_TTL_MS) {
-    return { ...updateCache.data, cached: true };
+/**
+ * 从 GitHub 的 releases.atom 解析版本信息。
+ *
+ * 为什么优先用 atom 而不是 REST API：
+ *   - api.github.com 匿名限流 60 次/小时（按 IP），用户多开几次就撞上了
+ *   - releases.atom 走网页 CDN，没有这个限制
+ *   - 而且它同样带 tag / 发布时间 / Release Notes
+ *
+ * @returns {Promise<Array>} 归一化后的 release 列表（新→旧）
+ */
+async function fetchReleasesFromAtom() {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15000);
+  let res;
+  try {
+    res = await fetch(`https://github.com/${UPDATE_REPO}/releases.atom`, {
+      signal: ac.signal,
+      headers: { 'User-Agent': 'dsh-qoder-relay', 'Accept': 'application/atom+xml' }
+    });
+  } finally {
+    clearTimeout(timer);
   }
+  if (!res.ok) throw new Error('atom HTTP ' + res.status);
 
+  const xml = await res.text();
+  const parts = xml.split('<entry>').slice(1);
+  const pick = (s, tag) => {
+    const m = new RegExp('<' + tag + '[^>]*>([\\s\\S]*?)</' + tag + '>').exec(s);
+    return m ? m[1].trim() : '';
+  };
+  const decode = (s) => s
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+
+  return parts.map((e) => {
+    // tag 从 id 里取：tag:github.com,2008:Repository/<id>/<tag>
+    const id = pick(e, 'id');
+    const idm = /Repository\/\d+\/(.+)$/.exec(id);
+    const tag = idm ? idm[1] : '';
+    const lm = /<link[^>]*rel="alternate"[^>]*href="([^"]+)"/.exec(e);
+    return {
+      tag_name: tag,
+      name: decode(pick(e, 'title')),
+      published_at: pick(e, 'updated') || null,
+      html_url: lm ? lm[1] : `https://github.com/${UPDATE_REPO}/releases/tag/${tag}`,
+      body: decode(pick(e, 'content')).replace(/<[^>]+>/g, '').trim(),
+      prerelease: false,
+      draft: false
+    };
+  }).filter((r) => r.tag_name);
+}
+
+/** 兜底：走 REST API（atom 解析失败时用）。 */
+async function fetchReleasesFromApi() {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 15000);
   let res;
   try {
     res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases?per_page=10`, {
       signal: ac.signal,
-      headers: {
-        'User-Agent': 'dsh-qoder-relay',
-        'Accept': 'application/vnd.github+json'
-      }
+      headers: { 'User-Agent': 'dsh-qoder-relay', 'Accept': 'application/vnd.github+json' }
     });
-  } catch (e) {
-    return { ok: false, current: CURRENT_VERSION, reason: 'network', message: '无法连接 GitHub：' + (e.message || String(e)) };
   } finally {
     clearTimeout(timer);
   }
-
   if (res.status === 403 || res.status === 429) {
-    return { ok: false, current: CURRENT_VERSION, reason: 'rate-limit', message: 'GitHub API 限流（匿名每小时 60 次）。稍后再试。' };
+    throw Object.assign(new Error('rate-limited'), { rateLimited: true });
   }
-  if (!res.ok) {
-    return { ok: false, current: CURRENT_VERSION, reason: 'http', message: 'GitHub 返回 HTTP ' + res.status };
+  if (!res.ok) throw new Error('api HTTP ' + res.status);
+  const list = await res.json();
+  if (!Array.isArray(list)) throw new Error('api returned non-array');
+  return list;
+}
+
+/**
+ * 检查更新：优先 atom，失败回落 REST API。
+ *
+ * @param {boolean} force - 忽略缓存
+ * @returns {Promise<object>} 检查结果
+ */
+async function checkUpdate(force) {
+  const now = Date.now();
+  if (!force && updateCache.data && now - updateCache.at < UPDATE_TTL_MS) {
+    return { ...updateCache.data, cached: true };
   }
 
-  let list;
-  try { list = await res.json(); } catch {
-    return { ok: false, current: CURRENT_VERSION, reason: 'parse', message: 'GitHub 返回内容无法解析。' };
+  let list = null;
+  let via = 'atom';
+  let atomError = null;
+
+  try {
+    list = await fetchReleasesFromAtom();
+  } catch (e) {
+    atomError = e;
+    try {
+      list = await fetchReleasesFromApi();
+      via = 'api';
+    } catch (e2) {
+      const reason = e2.rateLimited ? 'rate-limit' : 'network';
+      const message = e2.rateLimited
+        ? 'GitHub 限流，请稍后再试。'
+        : '无法获取版本信息：' + (e2.message || String(e2));
+      return { ok: false, current: CURRENT_VERSION, reason, message, atomError: atomError && atomError.message };
+    }
   }
-  if (!Array.isArray(list) || list.length === 0) {
+
+  if (!list || list.length === 0) {
     return { ok: false, current: CURRENT_VERSION, reason: 'no-release', message: '仓库还没有发布任何 Release。' };
   }
 
-  // 只比较稳定版；预发布单独列出但不作为"有更新"的判据
   const stable = list.filter((r) => r.prerelease !== true && r.draft !== true);
   const pool = stable.length > 0 ? stable : list;
   pool.sort((a, b) => compareVersions(b.tag_name, a.tag_name));
@@ -392,9 +464,9 @@ async function checkUpdate(force) {
     publishedAt: latest.published_at || null,
     url: latest.html_url || `https://github.com/${UPDATE_REPO}/releases/tag/${latest.tag_name}`,
     notes: typeof latest.body === 'string' ? latest.body.slice(0, 4000) : '',
-    // 装法给两条：pin tag 最稳，跟 main 最新
     install: `github:${UPDATE_REPO}#${latest.tag_name}`,
     checkedAt: new Date().toISOString(),
+    via,
     cached: false
   };
   updateCache = { at: now, data };

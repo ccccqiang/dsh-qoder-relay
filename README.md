@@ -151,10 +151,23 @@ worker 运行时不读 `auth.v1.dat`（实测 `auth.v1` 命中数为 0）。
 
 检查结果**缓存 10 分钟**，避免频繁请求。
 
-### 为什么检查走网关而不是浏览器
+### 数据来源：releases.atom，不是 REST API
 
-浏览器半边不能直接 `fetch` `api.github.com` —— 跨域会被拦（和登录端点一样的问题）。
-所以由网关代理：`GET /update/check`，内部调 GitHub Releases API。
+检查更新**默认走 `releases.atom`**（GitHub 的 Release RSS），原因：
+
+| 来源 | 限流 | 内容 |
+|---|---|---|
+| `api.github.com/repos/.../releases` | **匿名 60 次/小时**（按 IP） | 完整 |
+| `github.com/.../releases.atom` | **无**（走网页 CDN） | tag / 发布时间 / Notes 都有 |
+
+atom 里的 tag 从 `<id>tag:github.com,2008:Repository/<id>/<tag></id>` 取，
+Notes 是 HTML，剥标签后使用。只有在 atom 解析失败时才回落到 REST API。
+
+返回体里的 `via` 字段告诉你这次走的哪条路（`"atom"` 或 `"api"`）。
+
+### 为什么由网关代理而不是浏览器直连
+
+浏览器半边 `fetch` GitHub 会被跨域拦截（与登录端点同一问题），所以由网关代理。
 
 ### 手动检查
 
@@ -163,8 +176,7 @@ curl http://127.0.0.1:8788/update/check
 curl "http://127.0.0.1:8788/update/check?force=1"   # 忽略缓存
 ```
 
-GitHub 匿名 API 限流 60 次/小时。触发限流时端点返回 `reason: "rate-limit"`，界面会提示稍后再试。
-
+结果缓存 10 分钟。
 ## 设置页能做什么
 
 **设置 → Qoder CN**
