@@ -21,7 +21,7 @@
 ### 方式一：CLI 安装（推荐）
 
 ```bash
-dsh plugin --profile desktop install github:ccccqiang/dsh-qoder-relay#v0.2.0
+dsh plugin --profile desktop install github:ccccqiang/dsh-qoder-relay#v0.3.2
 ```
 
 ### 方式二：手动装进 profile
@@ -31,7 +31,7 @@ dsh plugin --profile desktop install github:ccccqiang/dsh-qoder-relay#v0.2.0
 ```json
 {
   "dependencies": {
-    "dsh-qoder-relay": "github:ccccqiang/dsh-qoder-relay#v0.2.0"
+    "dsh-qoder-relay": "github:ccccqiang/dsh-qoder-relay#v0.3.2"
   },
   "dsh": {
     "profile": {
@@ -92,6 +92,55 @@ refs:
 ```
 
 > **这条路由必须留在 profile 层。** 搬到 home 层会让「设置 → 模型」那页变空壳。
+
+---
+
+## 更新日志
+
+### v0.3.2
+
+**修复：思考链被整个丢弃。**
+
+网关起 CLI 时用的是 `--output-format stream-json`，但没带
+`--include-partial-messages`。Qoder 的 assistant 事件是**块级**的 ——
+一条 assistant 只带一个 content 块，先全部 `thinking`、再全部 `text`。
+原来的 `extractResult()` 只挑 `c.type === 'text'` 的块拼结果，
+`thinking` 块从头到尾没人读，于是思考内容全丢。
+
+改动三处（都在 `server.mjs`）：
+
+1. **`runQoder()`** 的 `cliArgs` 补 `--include-partial-messages`。
+2. **`extractResult()`** 改用 `collectBlocks()` 按 type 聚合所有块，
+   返回 `{ thinking, text }` —— 不是"取第一条"，否则多轮 thinking 块会被吞第二次。
+   `result.result` 为空时（流被截断/超时）也用聚合到的块兜底，不再整轮报错。
+3. **流式分支**先发 `reasoning_content` chunk、再发 `content` chunk
+   （保持"先思考后回答"的块顺序，pi-ai 的 `contentIndex` 靠这个推进）；
+   首块前补一条 `: qoder-relay upstream warming` 注释行做心跳。
+   非流式在 `message.reasoning_content` 显式披露，`exposeReasoning: false` 可关。
+
+**为什么下游接得住**：DSH 的 provider 层走 `@earendil-works/pi-ai` 的
+openai-completions 适配器，它按 `reasoning_content` → `reasoning` →
+`reasoning_text` 取第一个非空字段，翻成 `thinking_delta` 给 UI。
+管道下游完好，断点只在网关。
+
+**遗留**：`usage.input_tokens` / `output_tokens` 恒为 0 是 Qoder 上游不返回
+token 计数，与本次无关；计量仍走 `qoder_credits`。
+
+### v0.3.1
+
+检查更新改用 `releases.atom`，摆脱 REST API 的匿名限流（60 次/小时）。
+
+### v0.3.0
+
+设置页加「检查更新」卡片。
+
+### v0.2.1
+
+修复推理路径：`runQoder()` 之前用了空的 `electronExe`，导致所有推理 502。
+
+### v0.2.0
+
+首发。
 
 ---
 

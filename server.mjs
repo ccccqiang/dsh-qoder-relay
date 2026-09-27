@@ -26,7 +26,11 @@ const DEFAULTS = {
   sdkRoot: '',
   defaultModel: 'auto',
   requestTimeoutMs: 600000,
-  apiKey: ''            // 非空时校验 Bearer
+  apiKey: '',           // 非空时校验 Bearer
+  // 非流式响应是否把思考链放进 message.reasoning_content。
+  // 流式响应恒带 reasoning_content（本轮修复的核心），此项只管非流式。
+  // 设 false 可关掉 —— 少数严格校验的客户端会拒收未知字段。
+  exposeReasoning: true
 };
 
 const fileCfg = existsSync(CFG_PATH)
@@ -40,7 +44,8 @@ const cfg = {
   ...(process.env.QODER_RELAY_PORT ? { port: Number(process.env.QODER_RELAY_PORT) } : {}),
   ...(process.env.QODER_RELAY_HOST ? { host: process.env.QODER_RELAY_HOST } : {}),
   ...(process.env.QODER_SDK_ROOT ? { sdkRoot: process.env.QODER_SDK_ROOT } : {}),
-  ...(process.env.QODER_ELECTRON_EXE ? { electronExe: process.env.QODER_ELECTRON_EXE } : {})
+  ...(process.env.QODER_ELECTRON_EXE ? { electronExe: process.env.QODER_ELECTRON_EXE } : {}),
+  ...(process.env.QODER_RELAY_EXPOSE_REASONING ? { exposeReasoning: process.env.QODER_RELAY_EXPOSE_REASONING !== '0' } : {})
 };
 
 const SHIM = join(__dirname, 'shim.mjs');
@@ -80,7 +85,7 @@ function resolveEntry(req) {
 // ---- 调用 Qoder CLI，返回事件流 ----
 function runQoder({ prompt, model, cwd, systemPrompt, entry, signal }) {
   return new Promise((resolve, reject) => {
-    const cliArgs = ['-p', prompt, '--model', model, '--tools', '', '--output-format', 'stream-json'];
+    const cliArgs = ['-p', prompt, '--model', model, '--tools', '', '--output-format', 'stream-json', '--include-partial-messages'];
     if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
     if (cwd) cliArgs.push('-w', cwd);
 
@@ -158,28 +163,62 @@ function parseEvents(stdout) {
   return events;
 }
 
-function extractResult(events, raw, stderr) {
-  const result = events.find(e => e.type === 'result');
-  if (result) {
-    const text = typeof result.result === 'string' ? result.result : '';
-    const credits = typeof result.total_credits === 'number' ? result.total_credits : null;
-    const usage = result.usage || {};
-    return { text, credits, usage, isError: !!result.is_error, subtype: result.subtype };
-  }
-  // 无 result 事件：从 assistant 消息拼接
+/**
+ * 从 assistant 事件里收集 thinking / text 块。
+ *
+ * Qoder worker 的 assistant 事件是**块级**的：一条 assistant 只带一个
+ * content 块（先全部 thinking，再全部 text）。所以不能「取第一条」，
+ * 必须按 type 聚合，否则思考内容会被丢掉。
+ */
+function collectBlocks(events) {
+  let thinking = '';
   let text = '';
   for (const e of events) {
-    if (e.type === 'assistant' && e.message?.content) {
-      for (const c of e.message.content) {
-        if (c.type === 'text' && c.text) text += c.text;
+    if (e.type !== 'assistant' || !Array.isArray(e.message?.content)) continue;
+    for (const c of e.message.content) {
+      if (!c) continue;
+      if (c.type === 'thinking' && typeof c.thinking === 'string') thinking += c.thinking;
+      else if (c.type === 'text' && typeof c.text === 'string') text += c.text;
+      else if (c.type === 'redacted_thinking' && typeof c.data === 'string') {
+        thinking += '[redacted thinking]';
       }
     }
   }
-  if (text) return { text, credits: null, usage: {}, isError: false, subtype: 'inferred' };
+  return { thinking, text };
+}
+
+function extractResult(events, raw, stderr) {
+  const { thinking, text: blockText } = collectBlocks(events);
+  const result = events.find(e => e.type === 'result');
+  if (result) {
+    const text = typeof result.result === 'string' && result.result ? result.result : blockText;
+    const credits = typeof result.total_credits === 'number' ? result.total_credits : null;
+    const usage = result.usage || {};
+    return {
+      text,
+      reasoning: thinking,
+      credits,
+      usage,
+      isError: !!result.is_error,
+      subtype: result.subtype
+    };
+  }
+  // 无 result 事件（截断 / 被杀）：仍然把已拿到的块交出去
+  if (blockText || thinking) {
+    return {
+      text: blockText,
+      reasoning: thinking,
+      credits: null,
+      usage: {},
+      isError: false,
+      subtype: 'inferred'
+    };
+  }
 
   const err = events.find(e => e.type === 'result' && e.subtype && e.subtype !== 'success');
   return {
     text: '',
+    reasoning: '',
     credits: null,
     usage: {},
     isError: true,
@@ -798,26 +837,54 @@ const server = http.createServer(async (req, res) => {
       qoder_model: model
     };
 
+    // ── 思考链的字段名 ────────────────────────────────────────────────
+    //
+    // DSH 的 provider 层走 @earendil-works/pi-ai 的 openai-completions 适配器，
+    // 它在流里按 reasoning_content → reasoning → reasoning_text 的顺序取第一个
+    // 非空字段，翻成 thinking_delta（见 pi-ai dist/api/openai-completions.js 的
+    // "Some endpoints return reasoning in reasoning_content" 段）。
+    //
+    // 非流式是否披露思考链，由 cfg.exposeReasoning 决定（默认 on）。
+    // 注释与 DEFAULTS 保持一致：默认挂上 reasoning_content；
+    // 只有严格校验未知字段的客户端才需要设 QODER_RELAY_EXPOSE_REASONING=0。
+    const nonStreamReasoning = !(cfg.exposeReasoning === false || cfg.exposeReasoning === 'never');
+
     if (!stream) {
+      const message = { role: 'assistant', content: outcome.text };
+      // 只有开启 thinking 的路由才带：非推理模型（如 deepseek-flash）返回空串，
+      // 挂了反而让下游以为「有思考但为空」。
+      if (nonStreamReasoning && outcome.reasoning) message.reasoning_content = outcome.reasoning;
       return json(res, 200, {
         id, object: 'chat.completion', created, model,
-        choices: [{
-          index: 0,
-          message: { role: 'assistant', content: outcome.text },
-          finish_reason: 'stop'
-        }],
+        choices: [{ index: 0, message, finish_reason: 'stop' }],
         usage
       });
     }
 
-    // 流式：CLI 非流式返回，网关按块切分转发
+    // 流式：CLI 一次性返回，网关拼成 SSE。
+    // 首块之前先发一个纯注释的心跳，避免上游冷启动（每次 spawn 约 1s）期间
+    // 客户端读取超时；SSE 协议规定以 ':' 开头的行是注释，解析器会忽略。
     sse(res);
+    res.write(': qoder-relay upstream warming\n\n');
+
     sseSend(res, {
       id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
     });
 
     const CHUNK = 64;
+
+    // 先思考后回答：与 Claude/DeepSeek 的块顺序一致，保证 pi-ai 的
+    // contentIndex 推进正确（reasoning 块关掉之后才开 text 块）。
+    if (outcome.reasoning) {
+      for (let i = 0; i < outcome.reasoning.length; i += CHUNK) {
+        sseSend(res, {
+          id, object: 'chat.completion.chunk', created, model,
+          choices: [{ index: 0, delta: { reasoning_content: outcome.reasoning.slice(i, i + CHUNK) }, finish_reason: null }]
+        });
+      }
+    }
+
     for (let i = 0; i < outcome.text.length; i += CHUNK) {
       sseSend(res, {
         id, object: 'chat.completion.chunk', created, model,

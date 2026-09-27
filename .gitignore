@@ -14,6 +14,9 @@ config.json
 .DS_Store
 Thumbs.db
 
+# serena 语言服务缓存
+.serena/
+
 # 本机私有配置（绝不要提交）
 .credentials.yaml
 *.credentials.yaml
