@@ -83,7 +83,7 @@ function resolveEntry(req) {
 }
 
 // ---- 调用 Qoder CLI，返回事件流 ----
-function runQoder({ prompt, model, cwd, systemPrompt, entry, signal }) {
+function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) {
   return new Promise((resolve, reject) => {
     const cliArgs = ['-p', prompt, '--model', model, '--tools', '', '--output-format', 'stream-json', '--include-partial-messages'];
     if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
@@ -126,7 +126,22 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal }) {
       reject(Object.assign(new Error('qoder request timeout'), { code: 'UPSTREAM_TIMEOUT' }));
     }, cfg.requestTimeoutMs);
 
-    child.stdout.on('data', d => { stdout += d.toString('utf8'); });
+    // 边收边解析：把每一条完整的 JSON 行立刻交给 onEvent。
+    // 没有 onEvent 时行为与原来完全一致（只累积），非流式路径不受影响。
+    let lineBuf = '';
+    child.stdout.on('data', d => {
+      const s = d.toString('utf8');
+      stdout += s;
+      if (!onEvent) return;
+      lineBuf += s;
+      let nl;
+      while ((nl = lineBuf.indexOf('\n')) >= 0) {
+        const line = lineBuf.slice(0, nl).trim();
+        lineBuf = lineBuf.slice(nl + 1);
+        if (!line || line[0] !== '{') continue;
+        try { onEvent(JSON.parse(line)); } catch {}
+      }
+    });
     child.stderr.on('data', d => { stderr += d.toString('utf8'); });
 
     child.on('error', e => {
@@ -185,6 +200,81 @@ function collectBlocks(events) {
     }
   }
   return { thinking, text };
+}
+
+/**
+ * 增量块聚合器：把 stream-json 事件流实时翻译成增量文本。
+ *
+ * Qoder worker 的事件是**块级**的（这与 collectBlocks 的观察一致）：
+ *   content_block_start {type:"thinking"}  → 开一个思考块
+ *   content_block_delta {thinking_delta}   → 思考增量
+ *   content_block_start {type:"text"}      → 换到正文块
+ *   content_block_delta {text_delta}       → 正文增量
+ *
+ * 聚合器对每个事件算出「本事件新增了什么」，通过 onDelta(type, text) 立刻吐出去，
+ * 这样网关就能边收边转发，而不是等 CLI 跑完再切块。
+ *
+ * 同时保留完整文本累积（thinking / text 两个字符串），流程结束后与
+ * extractResult() 的结果做一致性校对 —— 两者不一致时以聚合器为准并告警，
+ * 因为聚合器看到的是真实到达顺序。
+ */
+function createBlockAggregator(onDelta) {
+  let thinking = '';
+  let text = '';
+  let current = null;      // 'thinking' | 'text' | null
+  let started = false;     // 是否已开过块（用于跳过 role 之前的噪声）
+
+  const emit = (kind, chunk) => {
+    if (!chunk) return;
+    if (kind === 'thinking') thinking += chunk;
+    else text += chunk;
+    onDelta(kind, chunk);
+  };
+
+  const feed = (e) => {
+    if (!e || e.type !== 'stream_event' || !e.event) return;
+    const ev = e.event;
+    const t = ev.type;
+
+    if (t === 'content_block_start') {
+      const bt = ev.content_block?.type;
+      if (bt === 'thinking' || bt === 'redacted_thinking') {
+        current = 'thinking';
+        started = true;
+        // 起始块可能自带初始文本
+        if (typeof ev.content_block.thinking === 'string') emit('thinking', ev.content_block.thinking);
+      } else if (bt === 'text') {
+        current = 'text';
+        started = true;
+        if (typeof ev.content_block.text === 'string') emit('text', ev.content_block.text);
+      }
+      return;
+    }
+
+    if (t === 'content_block_delta') {
+      const d = ev.delta;
+      if (!d) return;
+      if (d.type === 'thinking_delta' && typeof d.thinking === 'string') {
+        current = 'thinking';
+        emit('thinking', d.thinking);
+      } else if (d.type === 'text_delta' && typeof d.text === 'string') {
+        current = 'text';
+        emit('text', d.text);
+      }
+      return;
+    }
+
+    if (t === 'content_block_stop') {
+      current = null;
+    }
+  };
+
+  return {
+    feed,
+    get thinking() { return thinking; },
+    get text() { return text; },
+    get sawBlocks() { return started; }
+  };
 }
 
 function extractResult(events, raw, stderr) {
@@ -798,12 +888,52 @@ const server = http.createServer(async (req, res) => {
     const ac = new AbortController();
     req.on('aborted', () => ac.abort());
 
+    // ── 流式：先开 SSE 头，边收边转发 ──────────────────────────────────
+    //
+    // 原来是把 CLI 的 stdout 整个攒完再切块，导致首字节延迟 = 全部生成时间。
+    // 现在给 runQoder 挂 onEvent，事件一到就翻译成增量 chunk 发出去。
+    //
+    // 块顺序仍是「先思考后回答」：聚合器按上游真实到达顺序吐 delta，
+    // 因此 contentIndex 的推进天然正确，不需要人工重排。
+    let agg = null;
+    let sseOpen = false;
+    const openSse = () => {
+      if (sseOpen) return;
+      sseOpen = true;
+      sse(res);
+      res.write(': qoder-relay upstream warming\n\n');
+      sseSend(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+      });
+    };
+
+    const onEvent = (e) => {
+      if (!agg) return;
+      agg.feed(e);
+    };
+    const onDelta = (kind, chunk) => {
+      openSse();
+      const delta = kind === 'thinking' ? { reasoning_content: chunk } : { content: chunk };
+      sseSend(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta, finish_reason: null }]
+      });
+    };
+    if (stream) agg = createBlockAggregator(onDelta);
+
     let outcome;
     try {
       const { stdout, stderr } = await runQoder({
-        prompt, model, cwd: body.cwd, systemPrompt, entry, signal: ac.signal
+        prompt, model, cwd: body.cwd, systemPrompt, entry, signal: ac.signal,
+        onEvent
       });
       outcome = extractResult(parseEvents(stdout), stdout, stderr);
+      // 聚合器与 extractResult 不一致时，以聚合器为准（它看到的是真实到达顺序）
+      if (agg && agg.sawBlocks) {
+        if (agg.text && agg.text !== outcome.text) outcome.text = agg.text;
+        if (agg.thinking && agg.thinking !== (outcome.reasoning || '')) outcome.reasoning = agg.thinking;
+      }
     } catch (e) {
       const msg = e.message || String(e);
       if (stream) {
@@ -861,35 +991,27 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // 流式：CLI 一次性返回，网关拼成 SSE。
-    // 首块之前先发一个纯注释的心跳，避免上游冷启动（每次 spawn 约 1s）期间
-    // 客户端读取超时；SSE 协议规定以 ':' 开头的行是注释，解析器会忽略。
-    sse(res);
-    res.write(': qoder-relay upstream warming\n\n');
-
-    sseSend(res, {
-      id, object: 'chat.completion.chunk', created, model,
-      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-    });
-
-    const CHUNK = 64;
-
-    // 先思考后回答：与 Claude/DeepSeek 的块顺序一致，保证 pi-ai 的
-    // contentIndex 推进正确（reasoning 块关掉之后才开 text 块）。
-    if (outcome.reasoning) {
-      for (let i = 0; i < outcome.reasoning.length; i += CHUNK) {
+    // 流式：正文已在 onDelta 里边收边发，这里只做收尾。
+    //
+    // 兜底：如果上游一个 content_block 都没给（例如 worker 直接回了 result 事件），
+    // 聚合器不会产生任何 delta，此时把 outcome 整体补发一次，避免空响应。
+    openSse();
+    if (agg && !agg.sawBlocks) {
+      const CHUNK = 64;
+      if (outcome.reasoning) {
+        for (let i = 0; i < outcome.reasoning.length; i += CHUNK) {
+          sseSend(res, {
+            id, object: 'chat.completion.chunk', created, model,
+            choices: [{ index: 0, delta: { reasoning_content: outcome.reasoning.slice(i, i + CHUNK) }, finish_reason: null }]
+          });
+        }
+      }
+      for (let i = 0; i < outcome.text.length; i += CHUNK) {
         sseSend(res, {
           id, object: 'chat.completion.chunk', created, model,
-          choices: [{ index: 0, delta: { reasoning_content: outcome.reasoning.slice(i, i + CHUNK) }, finish_reason: null }]
+          choices: [{ index: 0, delta: { content: outcome.text.slice(i, i + CHUNK) }, finish_reason: null }]
         });
       }
-    }
-
-    for (let i = 0; i < outcome.text.length; i += CHUNK) {
-      sseSend(res, {
-        id, object: 'chat.completion.chunk', created, model,
-        choices: [{ index: 0, delta: { content: outcome.text.slice(i, i + CHUNK) }, finish_reason: null }]
-      });
     }
 
     sseSend(res, {
