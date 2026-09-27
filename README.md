@@ -3,7 +3,105 @@
 把 **Qoder CN 订阅额度**做成 DSH 的一部分：一个随宿主自动启停的本地 OpenAI 兼容网关，
 外加一个**设置页**用来完成登录。
 
+[![GitHub release](https://img.shields.io/github/v/release/ccccqiang/dsh-qoder-relay)](https://github.com/ccccqiang/dsh-qoder-relay/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
+---
+
+## 安装
+
+### 前置条件
+
+**必须已安装 Qoder CN 桌面端**（[qoder.cn](https://qoder.cn)）。
+
+网关不依赖它的 GUI 运行，但需要它的可执行文件当 Node 运行时。
+装在 `C:` / `D:` / `E:` / `F:` 任一盘符都能自动探测；
+装在非常规位置时用 `QODER_ELECTRON_EXE` 环境变量指定。
+
+### 方式一：CLI 安装（推荐）
+
+```bash
+dsh plugin --profile desktop install github:ccccqiang/dsh-qoder-relay#v0.2.0
+```
+
+### 方式二：手动装进 profile
+
+编辑 `$DSH_HOME/profiles/desktop/package.json`，两处都要改：
+
+```json
+{
+  "dependencies": {
+    "dsh-qoder-relay": "github:ccccqiang/dsh-qoder-relay#v0.2.0"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "...",
+        "dsh-qoder-relay"
+      ]
+    }
+  }
+}
+```
+
+然后安装依赖（`nodeLinker: hoisted` 是**复制**不是软链，必须跑这一步）：
+
+```powershell
+$pnpm = Get-ChildItem "$env:APPDATA\DSH Desktop\runtime-commands" -Recurse -Filter pnpm.cmd | Select-Object -First 1
+& $pnpm.FullName install --dir "$env:USERPROFILE\.dsh\profiles\desktop"
+```
+
+### 方式三：本地目录
+
+clone 到本地后把依赖写成：
+
+```json
+"dsh-qoder-relay": "file:D:/path/to/dsh-qoder-relay"
+```
+
+### 启用模型路由
+
+装完插件后，还要让 DSH 知道怎么用它。
+在 `$DSH_HOME/profiles/desktop/cordis.patch.yml` 的 `llm-pi-ai` 行里加一个 provider：
+
+```yaml
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      qoder:
+        displayName: Qoder CN
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/v1
+        apiKeyEnv: QODER_RELAY_KEY
+        models:
+          - id: auto
+            name: Qoder Auto
+          - id: deepseek-flash
+            name: DeepSeek Flash (Qoder)
+          - id: glm-5.3
+            name: GLM-5.3 (Qoder)
+          # …其余模型见「14 个模型」一节
+```
+
+再往 `$DSH_HOME/.credentials.yaml` 加一行（网关默认不校验，占位值即可）：
+
+```yaml
+refs:
+  QODER_RELAY_KEY: qoder-relay-local
+```
+
+> **这条路由必须留在 profile 层。** 搬到 home 层会让「设置 → 模型」那页变空壳。
+
+---
+
 ## 装完先做这一步
+
+**重启 DSH**（完全退出，托盘也退，再打开）。
+
+然后打开 **设置 → Qoder CN** 那个 tab，点「登录 Qoder」——
+会给你一个设备码链接，浏览器打开授权后即可。不用敲任何命令。
+
 
 **重启 DSH**（完全退出，托盘也退，再打开）。
 
