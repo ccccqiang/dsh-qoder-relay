@@ -1,0 +1,47 @@
+{
+  "name": "dsh-qoder-relay",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Qoder CN 订阅额度本地网关：以 ELECTRON_RUN_AS_NODE 驱动 Qoder 自带 headless CLI，暴露 OpenAI 兼容端点，随 DSH 宿主生命周期自动启停，并在设置页提供登录入口。",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": {
+      "default": "./lib/index.mjs"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "lib/",
+    "server.mjs",
+    "shim.mjs"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-bundle",
+    "deepseek-harness",
+    "qoder",
+    "relay",
+    "openai-compatible"
+  ],
+  "dsh": {
+    "displayName": "Qoder CN 额度网关",
+    "description": "把 Qoder CN 桌面端订阅额度暴露为 OpenAI 兼容 API，并随 DSH 自动启停；设置页提供登录入口。",
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  }
+}

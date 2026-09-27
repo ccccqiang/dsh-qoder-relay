@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 运行时产物
+*.log
+*.tmp
+.tmp/
+config.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本机私有配置（绝不要提交）
+.credentials.yaml
+*.credentials.yaml
+.env
+.env.local
+
+# 敏感凭证形态（防止手滑）
+auth.v1.dat
+*.pem
+*.key

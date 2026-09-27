@@ -1,0 +1,9 @@
+# dsh-qoder-relay bundle patch
+#
+# 一行 insert：插件管理器据此按 id 定位、从 UI 开关本插件。
+# 行内 name 是裸包名，按 profile 的 node_modules 解析，落在本包
+# package.json 的 main / exports 上 —— 所以两者都直指真实模块。
+
+- insert:
+    - id: qoder-relay
+      name: "dsh-qoder-relay"

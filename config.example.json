@@ -1,0 +1,11 @@
+{
+  "port": 8788,
+  "host": "127.0.0.1",
+  "electronExe": "",
+  "sdkRoot": "",
+  "defaultModel": "auto",
+  "requestTimeoutMs": 600000,
+  "apiKey": "",
+  "qoderConfigDir": "",
+  "debug": false
+}
