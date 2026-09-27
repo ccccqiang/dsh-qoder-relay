@@ -139,6 +139,32 @@ worker 运行时不读 `auth.v1.dat`（实测 `auth.v1` 命中数为 0）。
 
 ---
 
+---
+
+## 检查更新
+
+**设置 → Qoder CN → 版本** 卡片会自动检查 GitHub 上的最新 Release。
+
+- 有新版本时显示 `当前版本 → 新版本`，并给出可直接粘贴的依赖行
+- 可展开查看该版本的更新说明
+- 「打开发布页」跳到 GitHub Release 页面
+
+检查结果**缓存 10 分钟**，避免频繁请求。
+
+### 为什么检查走网关而不是浏览器
+
+浏览器半边不能直接 `fetch` `api.github.com` —— 跨域会被拦（和登录端点一样的问题）。
+所以由网关代理：`GET /update/check`，内部调 GitHub Releases API。
+
+### 手动检查
+
+```bash
+curl http://127.0.0.1:8788/update/check
+curl "http://127.0.0.1:8788/update/check?force=1"   # 忽略缓存
+```
+
+GitHub 匿名 API 限流 60 次/小时。触发限流时端点返回 `reason: "rate-limit"`，界面会提示稍后再试。
+
 ## 设置页能做什么
 
 **设置 → Qoder CN**

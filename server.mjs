@@ -301,6 +301,106 @@ function runCli(args, timeoutMs) {
   });
 }
 
+// ---- 更新检查 ----
+//
+// 浏览器半边不能直接 fetch api.github.com（CORS），所以由网关代理。
+// GitHub 匿名限流 60 次/小时，足够手动检查；结果缓存 10 分钟避免连点。
+
+const UPDATE_REPO = 'ccccqiang/dsh-qoder-relay';
+const UPDATE_TTL_MS = 10 * 60 * 1000;
+const CURRENT_VERSION = (() => {
+  try {
+    const pj = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'));
+    return typeof pj.version === 'string' ? pj.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
+let updateCache = { at: 0, data: null };
+
+/** 语义化版本比较：a > b 返回正数，相等 0，小于负数。只处理 x.y.z 形态。 */
+function compareVersions(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/**
+ * 拉取最新 release 并与当前版本比较。
+ *
+ * @param {boolean} force - 忽略缓存
+ * @returns {Promise<object>} 检查结果
+ */
+async function checkUpdate(force) {
+  const now = Date.now();
+  if (!force && updateCache.data && now - updateCache.at < UPDATE_TTL_MS) {
+    return { ...updateCache.data, cached: true };
+  }
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15000);
+  let res;
+  try {
+    res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases?per_page=10`, {
+      signal: ac.signal,
+      headers: {
+        'User-Agent': 'dsh-qoder-relay',
+        'Accept': 'application/vnd.github+json'
+      }
+    });
+  } catch (e) {
+    return { ok: false, current: CURRENT_VERSION, reason: 'network', message: '无法连接 GitHub：' + (e.message || String(e)) };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (res.status === 403 || res.status === 429) {
+    return { ok: false, current: CURRENT_VERSION, reason: 'rate-limit', message: 'GitHub API 限流（匿名每小时 60 次）。稍后再试。' };
+  }
+  if (!res.ok) {
+    return { ok: false, current: CURRENT_VERSION, reason: 'http', message: 'GitHub 返回 HTTP ' + res.status };
+  }
+
+  let list;
+  try { list = await res.json(); } catch {
+    return { ok: false, current: CURRENT_VERSION, reason: 'parse', message: 'GitHub 返回内容无法解析。' };
+  }
+  if (!Array.isArray(list) || list.length === 0) {
+    return { ok: false, current: CURRENT_VERSION, reason: 'no-release', message: '仓库还没有发布任何 Release。' };
+  }
+
+  // 只比较稳定版；预发布单独列出但不作为"有更新"的判据
+  const stable = list.filter((r) => r.prerelease !== true && r.draft !== true);
+  const pool = stable.length > 0 ? stable : list;
+  pool.sort((a, b) => compareVersions(b.tag_name, a.tag_name));
+  const latest = pool[0];
+  const latestVersion = String(latest.tag_name).replace(/^v/, '');
+  const hasUpdate = compareVersions(latestVersion, CURRENT_VERSION) > 0;
+
+  const data = {
+    ok: true,
+    repo: UPDATE_REPO,
+    current: CURRENT_VERSION,
+    latest: latestVersion,
+    latestTag: latest.tag_name,
+    hasUpdate,
+    publishedAt: latest.published_at || null,
+    url: latest.html_url || `https://github.com/${UPDATE_REPO}/releases/tag/${latest.tag_name}`,
+    notes: typeof latest.body === 'string' ? latest.body.slice(0, 4000) : '',
+    // 装法给两条：pin tag 最稳，跟 main 最新
+    install: `github:${UPDATE_REPO}#${latest.tag_name}`,
+    checkedAt: new Date().toISOString(),
+    cached: false
+  };
+  updateCache = { at: now, data };
+  return data;
+}
+
 /**
  * 读 CLI 登录态。
  *
@@ -533,6 +633,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) {
       if (!checkAuth(req)) return json(res, 401, { error: { message: 'invalid api key' } });
       return json(res, 200, { object: 'list', data: MODEL_LIST }, req);
+    }
+
+    // ── 更新检查 ──（浏览器不能直连 api.github.com，由网关代理）
+    if (path === '/update/check') {
+      if (!checkAuth(req)) return json(res, 401, { error: { message: 'invalid api key' } }, req);
+      const force = url.searchParams.get('force') === '1';
+      return json(res, 200, await checkUpdate(force), req);
     }
 
     // ── 登录控制端点 ──（浏览器半边用，不经 DSH 服务协议）
