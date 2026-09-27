@@ -1,6 +1,6 @@
 {
   "name": "dsh-qoder-relay",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "description": "Qoder CN 订阅额度本地网关：以 ELECTRON_RUN_AS_NODE 驱动 Qoder 自带 headless CLI，暴露 OpenAI 兼容端点，随 DSH 宿主生命周期自动启停，并在设置页提供登录入口。",
   "type": "module",
