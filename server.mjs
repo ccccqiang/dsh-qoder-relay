@@ -84,17 +84,31 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal }) {
     if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
     if (cwd) cliArgs.push('-w', cwd);
 
+    // 必须走探测函数 —— 不能直接用 cfg.electronExe / cfg.sdkRoot。
+    // 那两个默认是空字符串（留空 = 自动探测），直接 spawn 会抛
+    //   ERR_INVALID_ARG_VALUE: The argument 'file' cannot be empty
+    const exe = findElectron();
+    const sdk = findSdkRoot(exe);
+    if (!exe || !sdk) {
+      const missing = !exe ? 'Qoder CN 安装目录' : 'qoder-cn-agent-sdk 的 _worker 目录';
+      const hint = !exe
+        ? '请确认已安装 Qoder CN 桌面端，或用 QODER_ELECTRON_EXE 指定可执行文件路径。'
+        : '请确认 Qoder CN 安装完整，或用 QODER_SDK_ROOT 指定 _worker 目录。';
+      reject(Object.assign(new Error('找不到 ' + missing + '。' + hint), { code: 'QODER_NOT_FOUND' }));
+      return;
+    }
+
     const env = {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
-      QODER_SDK_ROOT: cfg.sdkRoot,
-      QODER_WORKER_RUNTIME_ASSET_ROOT: cfg.sdkRoot,
+      QODER_SDK_ROOT: sdk,
+      QODER_WORKER_RUNTIME_ASSET_ROOT: sdk,
       QODER_RELAY_ARGS: JSON.stringify(cliArgs),
       QODERCN_ENTRY: entry || '',
       QODER_RELAY_DEBUG: '0'
     };
 
-    const child = spawn(cfg.electronExe, [SHIM], { env, windowsHide: true });
+    const child = spawn(exe, [SHIM], { env, windowsHide: true });
 
     let stdout = '';
     let stderr = '';
