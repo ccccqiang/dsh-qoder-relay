@@ -97,6 +97,46 @@ refs:
 
 ## 更新日志
 
+### v0.3.4
+
+**设置页的版本卡片现在能一键更新了。**
+
+原来只做「检查更新」，发现新版本后要用户自己去插件页动手。现在卡片多一个
+「立即更新到 vX.Y.Z」按钮，点击直接走 DSH 官方的 `pluginManager.installBundle()`。
+
+实现要点（都在 host 半边 `lib/index.mjs`）：
+
+- 服务不能直接取值。`webServer` / `pluginManager` 都可能比本插件晚就绪，
+  直接 `ctx.pluginManager` 会拿到 `undefined`。必须用
+  `ctx.inject(["webServer", "pluginManager"], cb)`，等服务可用时才跑回调
+  —— 这是官方 `dsh-plugin-manager` 的用法。
+- 路由注册在 `host.effect()` 里，返回值即 teardown，热重载不泄漏。
+- 端点是 `POST /qoder-relay/update`，挂在**宿主 Web 服务**上（不是网关 8788），
+  所以客户端用原生 `fetch` 而不是网关的 `api()`。
+
+> `installBundle` 走的是 `dsh plugin` 同一套 pnpm。如果 profile 里有别的依赖用
+> 浮动地址（如 `heads/master.tar.gz`），pnpm 的完整性校验会连带让本次安装失败
+> —— 那是那些依赖的问题，与本插件无关。卡片会如实显示失败原因。
+
+### v0.3.3
+
+**真流式转发，不再等上游跑完一次性吐出。**
+
+原来 `runQoder()` 把 CLI 的 stdout 整个攒进变量，`child.on('close')` 才 resolve，
+网关再切成 64 字符分片瞬间发完 —— 首字节延迟等于全部生成时间。
+
+实测同一 prompt：9.9 秒里前 9 秒零输出，然后 16 条 SSE 瞬间喷完。
+
+- `runQoder()` 增加 `onEvent` 回调：按行切分 stdout，每收到一条完整 JSON
+  立刻交给下游。无 `onEvent` 时行为与原来完全一致。
+- 新增 `createBlockAggregator()`：把 `content_block_start` / `content_block_delta`
+  实时翻译成增量文本，按上游真实到达顺序吐 delta，
+  因此 `contentIndex` 的推进天然正确。
+- 请求主流程：流式时提前开 SSE 头，边收边发；收尾只补 finish chunk。
+
+实测事件数由 16 增至 166，reasoning/content 逐词到达。
+首字节 8.9s 是 Qoder 上游冷启动固有延迟，与本次改动无关。
+
 ### v0.3.2
 
 **修复：思考链被整个丢弃。**
