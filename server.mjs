@@ -84,7 +84,7 @@ function resolveEntry(req) {
 }
 
 // ---- 调用 Qoder CLI，返回事件流 ----
-function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) {
+function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent, reasoningEffort, maxOutputTokens }) {
   return new Promise((resolve, reject) => {
     // 控制台里必须没有第二个工具通道。
     //
@@ -99,17 +99,35 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) 
     // 真正管用的是 --setting-sources：serena 定义在 user 源里，只加载 project 源就没有了。
     // 实测：user 源 → 1 个 MCP 服务器；project / local 源 → "No MCP servers configured"。
     // 登录凭证在 ~/.qoder-cn/.auth，不属于 setting source，切换后照常可用。
-    const cliArgs = [
-      '-p', prompt,
+    // 参数顺序是实测出来的，不是随手排的：**-p <prompt> 必须排在最前面**。
+    // 只要 --system-prompt 出现在 -p 之前，CLI 就有约 2/3 的概率收不到 prompt ——
+    // 模型回一句"我没有看到具体的任务内容，只有环境初始化信息"，而 manifest.json 里
+    // argv 明明是完整的。把 -p 提到最前、其余选项后置之后，同一套参数连跑 6 次全中。
+    //
+    // 网关本身就是无状态的（多轮由 flattenMessages 拍平后整段送进去），
+    // 所以 CLI 那侧的会话持久化必须关掉：它默认把每轮写进 ~/.qoder-cn/projects，
+    // 又可能把历史会话/memory 混进新请求，实测表现为约 1/3 的请求里模型答非所问
+    // （"我来看一下这台机器上的工作目录和运行状态" 这种），而 argv 里的 prompt 明明是对的。
+    // --settings 显式关掉 user 级插件 qoder-context：它通过 user-prompt-submit /
+    // qoder-context-prompt 两个 hook 介入 prompt 提交流程（日志里能看到
+    // "hook request deferred until ..."），实测会让约 1/4 的请求里模型根本收不到 prompt，
+    // 回一句"已就绪，有什么任务？"。注意 --setting-sources project 挡不住它：
+    // 插件列表仍显示 Scope: user / Status: enabled，必须用 --settings 显式关。
+    const cliArgs = ['-p', prompt];
+    cliArgs.push(
       '--model', model,
       '--tools', '',
       '--strict-mcp-config',
       '--setting-sources', 'project',
+      '--no-session-persistence',
+      '--settings', '{"enabledPlugins":{"qoder-context@qoderapp-bundler":false}}',
       '--output-format', 'stream-json',
       '--include-partial-messages'
-    ];
-    if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
+    );
+    if (ENABLE_REASONING_EFFORT && reasoningEffort) cliArgs.push('--reasoning-effort', String(reasoningEffort));
+    if (maxOutputTokens) cliArgs.push('--max-output-tokens', String(maxOutputTokens));
     if (cwd) cliArgs.push('-w', cwd);
+    if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
 
     // 必须走探测函数 —— 不能直接用 cfg.electronExe / cfg.sdkRoot。
     // 那两个默认是空字符串（留空 = 自动探测），直接 spawn 会抛
@@ -370,6 +388,11 @@ function extractResult(events, raw, stderr) {
 //
 // 实测：deepseek-flash / glm-5.3-flash 都能稳定按此格式输出，也包括 write 这类
 // 带长文本参数的工具。
+
+// 推理强度档位原样转发给 CLI 的 --reasoning-effort。
+// 曾经误判它"会让 CLI 丢 prompt"，真因是 CLI 默认的会话持久化（见下面 cliArgs 的注释）：
+// 关掉持久化之后，--reasoning-effort 的表现是稳定的。
+const ENABLE_REASONING_EFFORT = true;
 
 const TOOL_OPEN = '<tool_call>';
 const TOOL_CLOSE = '</tool_call>';
@@ -1206,6 +1229,14 @@ const server = http.createServer(async (req, res) => {
     const tools = Array.isArray(body.tools)
       ? body.tools.filter(t => t && (t.function?.name || t.name))
       : [];
+    // 推理强度与输出上限：DSH 只在模型声明了对应能力时才会发这两个字段，
+    // 这里原样转给 CLI —— 档位到 wire 值的映射由 DSH 的 thinkingLevelMap 决定，
+    // 网关不做二次解释。
+    const effortRaw = body.reasoning_effort ?? body.reasoningEffort ?? null;
+    const reasoningEffort = typeof effortRaw === 'string' && effortRaw && effortRaw !== 'off' ? effortRaw : '';
+    const maxTokensRaw = body.max_completion_tokens ?? body.max_tokens ?? null;
+    const maxOutputTokens = Number.isFinite(maxTokensRaw) && maxTokensRaw > 0 ? Math.floor(maxTokensRaw) : 0;
+
     const flat = flattenMessages(body.messages, body.system);
     const prompt = flat.prompt;
     if (!prompt) return json(res, 400, { error: { message: 'no user content in messages' } });
@@ -1288,7 +1319,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const { stdout, stderr } = await runQoder({
         prompt, model, cwd: body.cwd, systemPrompt, entry, signal: ac.signal,
-        onEvent
+        onEvent, reasoningEffort, maxOutputTokens
       });
       outcome = extractResult(parseEvents(stdout), stdout, stderr);
       // 聚合器与 extractResult 不一致时，以聚合器为准（它看到的是真实到达顺序）

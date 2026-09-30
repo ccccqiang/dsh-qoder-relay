@@ -145,24 +145,53 @@ refs:
   system prompt 加上工具 schema 轻松上万字符，会撞穿 Windows 进程环境块 32767 字符的
   上限，spawn 直接失败。
 
-**上游 MCP 必须关掉（最隐蔽的一环，线上翻车才发现）**
+**上游生态里有三个干扰源必须关掉，只关一个不够**
 
-Qoder 的用户级配置 `~/.qoder-cn/settings.json` 里挂着 serena MCP。它的 instructions
-会跟我们的文本协议抢注意力 —— 而**这件事只在 system prompt 长的时候才暴露**：
-短 prompt 下模型懒得验证、直接照做协议；真实 DSH 的 system prompt 一长，模型就转头
-去试 serena 的工具，撞上 `Permission confirmation required but no interactive handler
-is available` 之后干脆放弃动手，回头告诉用户"当前环境没有可用工具"。
+这三条都是线上翻车才挖出来的，而且**单独测任何一条都可能"看起来没问题"** ——
+抖动率在 20%~60% 之间浮动，短 prompt、小样本全绿说明不了任何事。
 
-更致命的是协议里写着「本环境没有给你注册任何原生函数工具，也没有可用的 MCP 工具」——
-这句话在 serena 实际可见时是**假话**，被模型当场验证之后，整段协议都不再可信。
+1. **serena MCP**（`~/.qoder-cn/settings.json` 的 `mcpServers`）。它的 instructions 会跟
+   我们的文本协议抢注意力，而这件事**只在 system prompt 长的时候才暴露**：短 prompt 下
+   模型懒得验证、直接照做协议；真实 DSH 的 system prompt 一长，模型就转头去试 serena 的
+   工具，撞上 `Permission confirmation required but no interactive handler is available`
+   之后干脆放弃动手，回头告诉用户"当前环境没有可用工具"。更致命的是协议里写着「本环境
+   没有任何可用工具」—— 这句话在 serena 实际可见时是**假话**，被模型当场验证之后整段
+   协议都不再可信。`--strict-mcp-config` / `--mcp-config '{}'` 都挡不住（那只管
+   `mcp.json` 那层），要用 **`--setting-sources project`**：serena 定义在 user 源里，
+   实测 user 源 → 1 个 MCP 服务器，`project` / `local` 源 → `No MCP servers configured`。
+2. **qoder-context 插件**（user scope，`--setting-sources` 挡不住它 —— `plugins list` 里
+   仍然显示 `Scope: user / Status: enabled`）。它通过 `user-prompt-submit` 与
+   `qoder-context-prompt` 两个 hook 介入 prompt 提交流程（`~/.qoder-cn/logs/qoder-context.log`
+   里能看到 `hook request deferred until ...`）。要用
+   **`--settings '{"enabledPlugins":{"qoder-context@qoderapp-bundler":false}}'`** 显式关掉，
+   关掉后 `plugins list` 才会显示 `Status: disabled`。
+3. **CLI 的会话持久化**。它默认把每轮写进 `~/.qoder-cn/projects`（本机已有 393 个文件）。
+   网关自己就是无状态的（多轮由 `flattenMessages()` 拍平后整段送进去），这层持久化
+   只会让旧会话串进新请求，用 **`--no-session-persistence`** 关掉。
 
-`--strict-mcp-config` 和 `--mcp-config '{}'` 都挡不住（那只管 `mcp.json` 那层）。
-真正管用的是 **`--setting-sources project`**：serena 定义在 user 源里，只加载 project
-源之后就没了。实测 `--setting-sources user` → 1 个 MCP 服务器；
-`project` / `local` → `No MCP servers configured`。
+登录凭证在 `~/.qoder-cn/.auth`，不属于 setting source，切源后照常可用（已实测推理正常）。
 
-代价：user 级的 `enabledPlugins`（qoder-context）也不再加载。登录凭证在
-`~/.qoder-cn/.auth`，不属于 setting source，切源后照常可用（已实测推理正常）。
+**参数顺序是正确性问题，不是风格问题**
+
+`-p <prompt>` **必须排在 argv 最前面**，其余选项一律后置。只要 `--system-prompt` 出现在
+它之前，CLI 就有约 2/3 的概率收不到 prompt：模型回一句"我没有看到具体的任务内容，只有
+环境初始化信息"，而 `~/.qoder-cn/logs/runs/<id>/manifest.json` 里 argv 明明是完整的。
+实测对照（同一套参数，只改顺序）：`--system-prompt` 在前 → 2/6 正常；`-p` 提到最前 →
+6/6，再加上全套干扰源开关连跑 12 次仍是 12/12。
+
+**能力声明补齐到和其他路由一样**
+
+profile 里 15 个模型现在都有完整声明，每个值都有出处：
+
+| 字段 | 值 | 出处 |
+|---|---|---|
+| `contextWindow` | 200000 | CLI 自己的运行日志：`model=qfmodel ... context_window=200000`（`qmodel_38max` 也出现过 128000）。第三方 `@jischeng/pi-provider-qoder` 给 CN 标的是 1M，但那是官方 openapi 路径的取值；我们走 CLI，以 CLI 实测为准 |
+| `maxTokens` | 65536 | CLI 支持 `--max-output-tokens`，网关已转发 DSH 的 `max_completion_tokens`；这个档位与 cun 路由一致，不是上游公布的硬上限 |
+| `input` | `[text]` | 网关是纯文本通道（CLI 的 `-p` prompt，没有多模态入口） |
+| `reasoningEfforts` | 只有 Qwen3.8-Max / Qwen3.8-Flash / GLM-5.3 | 实测 `--reasoning-effort` 对思考长度确有影响；其余模型照样吐思考链，只是不提供档位选择 |
+
+配合这些声明，网关开始转发 DSH 的 `reasoning_effort` 与 `max_completion_tokens`
+（→ CLI 的 `--reasoning-effort` / `--max-output-tokens`）。
 
 ### v0.3.4
 
