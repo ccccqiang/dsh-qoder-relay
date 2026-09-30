@@ -86,7 +86,28 @@ function resolveEntry(req) {
 // ---- 调用 Qoder CLI，返回事件流 ----
 function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) {
   return new Promise((resolve, reject) => {
-    const cliArgs = ['-p', prompt, '--model', model, '--tools', '', '--output-format', 'stream-json', '--include-partial-messages'];
+    // 控制台里必须没有第二个工具通道。
+    //
+    // Qoder 的用户级 settings.json 里挂着 serena MCP（~/.qoder-cn/settings.json
+    // 的 mcpServers）。它的 instructions 会和我们的文本协议抢注意力：system prompt
+    // 一长，模型就转头去试 serena 的工具，撞上 "Permission confirmation required but
+    // no interactive handler is available" 之后干脆放弃动手，回头告诉用户"工具不可用"。
+    // 更糟的是我们那段协议写着"本环境没有任何可用工具"——被模型验证为假话之后，
+    // 整段协议都不再可信。
+    //
+    // --strict-mcp-config 和 --mcp-config '{}' 都挡不住它（那是 mcp.json 那层的开关），
+    // 真正管用的是 --setting-sources：serena 定义在 user 源里，只加载 project 源就没有了。
+    // 实测：user 源 → 1 个 MCP 服务器；project / local 源 → "No MCP servers configured"。
+    // 登录凭证在 ~/.qoder-cn/.auth，不属于 setting source，切换后照常可用。
+    const cliArgs = [
+      '-p', prompt,
+      '--model', model,
+      '--tools', '',
+      '--strict-mcp-config',
+      '--setting-sources', 'project',
+      '--output-format', 'stream-json',
+      '--include-partial-messages'
+    ];
     if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
     if (cwd) cliArgs.push('-w', cwd);
 

@@ -145,6 +145,25 @@ refs:
   system prompt 加上工具 schema 轻松上万字符，会撞穿 Windows 进程环境块 32767 字符的
   上限，spawn 直接失败。
 
+**上游 MCP 必须关掉（最隐蔽的一环，线上翻车才发现）**
+
+Qoder 的用户级配置 `~/.qoder-cn/settings.json` 里挂着 serena MCP。它的 instructions
+会跟我们的文本协议抢注意力 —— 而**这件事只在 system prompt 长的时候才暴露**：
+短 prompt 下模型懒得验证、直接照做协议；真实 DSH 的 system prompt 一长，模型就转头
+去试 serena 的工具，撞上 `Permission confirmation required but no interactive handler
+is available` 之后干脆放弃动手，回头告诉用户"当前环境没有可用工具"。
+
+更致命的是协议里写着「本环境没有给你注册任何原生函数工具，也没有可用的 MCP 工具」——
+这句话在 serena 实际可见时是**假话**，被模型当场验证之后，整段协议都不再可信。
+
+`--strict-mcp-config` 和 `--mcp-config '{}'` 都挡不住（那只管 `mcp.json` 那层）。
+真正管用的是 **`--setting-sources project`**：serena 定义在 user 源里，只加载 project
+源之后就没了。实测 `--setting-sources user` → 1 个 MCP 服务器；
+`project` / `local` → `No MCP servers configured`。
+
+代价：user 级的 `enabledPlugins`（qoder-context）也不再加载。登录凭证在
+`~/.qoder-cn/.auth`，不属于 setting source，切源后照常可用（已实测推理正常）。
+
 ### v0.3.4
 
 **设置页的版本卡片现在能一键更新了。**
@@ -444,6 +463,9 @@ foreach($f in @('lib\index.mjs','lib\client.js','server.mjs','shim.mjs','package
   `<tool_call>` 块才会被识别。解析器做了容错（Markdown 围栏、尾随逗号、被切开的标签、
   流被截断时尽力解析），但模型偶尔仍会不守格式 —— 表现为该调工具却没调、直接把答案
   写在正文里。提示措辞对这种偏差非常敏感，改动 `buildToolSystemPrompt()` 后务必重测。
+  上游的 serena MCP 已经在启动参数里关掉（`--setting-sources project`）；
+  如果哪天它又出现，模型会先被它带偏、再因为协议"撒谎"而整体不信。
+  **长 system prompt 是这个 bug 的必要条件**，短 prompt 测不出来。
 - 每次请求起一个 worker 进程（约 1s 冷启动）。
 - 会话无状态：多轮由网关把 messages 拍平成对话文本。
 - 上游不返回 token 计数，只能用 `qoder_credits` 计量。
