@@ -424,6 +424,8 @@ foreach($f in @('lib\index.mjs','lib\client.js','server.mjs','shim.mjs','package
 
 ## 已知限制
 
+- **图片进不去**：工具结果里的图片块（`read_image`）会被压成 `[图片已省略]`，
+  因为整条通道是 CLI 的文本 prompt，没有多模态输入。
 - **工具调用是文本协议桥**，不是上游原生 function calling。模型必须按约定格式输出
   `<tool_call>` 块才会被识别。解析器做了容错（Markdown 围栏、尾随逗号、被切开的标签、
   流被截断时尽力解析），但模型偶尔仍会不守格式 —— 表现为该调工具却没调、直接把答案
