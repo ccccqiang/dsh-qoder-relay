@@ -557,6 +557,18 @@ function createToolCallExtractor({ onText, onToolCall }) {
 }
 
 // ---- 把 OpenAI messages 压成单条 prompt ----
+/** 一段 content 里有没有图片块。 */
+function contentHasImage(content) {
+  if (!Array.isArray(content)) return false;
+  return content.some(c => c && typeof c === 'object' &&
+    (c.type === 'image_url' || c.type === 'input_image' || c.image_url));
+}
+
+/** 整个请求里有没有图片块（含工具结果里的）。 */
+function messagesHaveImage(messages) {
+  return (messages || []).some(m => contentHasImage(m && m.content));
+}
+
 function contentToText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -564,7 +576,7 @@ function contentToText(content) {
     if (typeof c === 'string') return c;
     if (!c) return '';
     if (c.type === 'text' || c.type === 'input_text') return c.text || '';
-    if (c.type === 'image_url' || c.type === 'input_image') return '[图片已省略]';
+    // 图片走不到这里：入口已经用 messagesHaveImage 拒掉整条请求。
     return '';
   }).join('');
 }
@@ -1156,6 +1168,20 @@ const server = http.createServer(async (req, res) => {
     catch { return json(res, 400, { error: { message: 'invalid json body' } }); }
 
     const model = resolveModel(body.model);
+
+    // 纯文本通道：输入最终是 CLI 的 `-p <prompt>`，没有任何多模态入口。
+    // 与其把图片悄悄压成占位符、让模型对着看不见的图说"读过了"，不如直接拒绝 ——
+    // 这也是 DSH 里其他纯文本模型的表现（pi-ai 层同样抛 UNSUPPORTED_CONTENT）。
+    if (messagesHaveImage(body.messages)) {
+      return json(res, 400, {
+        error: {
+          message: 'qoder-relay model "' + model + '" does not support image input',
+          type: 'unsupported_content',
+          code: 'UNSUPPORTED_CONTENT'
+        }
+      });
+    }
+
     const tools = Array.isArray(body.tools)
       ? body.tools.filter(t => t && (t.function?.name || t.name))
       : [];
