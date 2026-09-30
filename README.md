@@ -81,7 +81,7 @@ clone 到本地后把依赖写成：
             name: DeepSeek Flash (Qoder)
           - id: glm-5.3
             name: GLM-5.3 (Qoder)
-          # …其余模型见「14 个模型」一节
+          # …其余模型见「15 个模型」一节
 ```
 
 再往 `$DSH_HOME/.credentials.yaml` 加一行（网关默认不校验，占位值即可）：
@@ -96,6 +96,42 @@ refs:
 ---
 
 ## 更新日志
+
+### v0.4.0
+
+**模型现在能调用 DSH 的工具了 —— 读写文件、执行命令、检索代码，跟别的模型一样。**
+
+在此之前，用 Qoder 的模型只能聊天：让它改文件，它只会把内容打印出来。原因有两层：
+
+1. 网关从没读过请求里的 `tools[]`，也从没产出过 `tool_calls[]`。DSH 把工具列表发过来
+   直接被丢掉，模型根本不知道有工具这回事。
+2. 上游也不接受 OpenAI 的 function calling —— Qoder worker CLI 是个自带工具的 agent，
+   它的 `--print` 协议只吐 thinking / text 块，没有工具通道可以原样转发。
+
+做法是一层**文本协议桥**（都在 `server.mjs`）：
+
+- **入方向**：`tools[]` 渲染进 system prompt，约定模型用
+  `<tool_call>{"name":"..","arguments":{..}}</tool_call>` 表达调用；
+- **出方向**：`createToolCallExtractor()` 把该块从正文流里实时剥出来，翻译成 OpenAI 的
+  `tool_calls` 增量，`finish_reason` 相应变成 `tool_calls`。
+
+工具的执行权仍然留在 DSH：没放开 CLI 自带的工具（`--tools ''` 保持原样）。走
+`--tools default` 会让 Qoder 自己动手改文件，DSH 既看不到工具卡片，也没有审批与回滚。
+
+**提示措辞必须够硬（踩过的坑）**：第一版协议段写的是「你能调用宿主提供的工具」，
+结果模型转头去试 Qoder CLI 自带的工具链，拿回一串 `Tool not found` 和 MCP 权限报错，
+然后告诉用户「当前环境没有注册宿主工具」，完全不理文本协议。改成显式否认原生工具
+（「本环境没有给你注册任何原生函数工具，也没有可用的 MCP 工具，你对工具的所有调用
+都必须用下面的文本块表达」）之后，同一个模型、同一句提问，立刻稳定输出协议块。
+
+**另外两处必要改动**：
+
+- `flattenMessages()` 现在认 `assistant.tool_calls` 与 `role:"tool"`。原来工具结果被当成
+  一条普通 User 消息，模型看到的是「用户凭空说了句话」，于是把同一个工具再调一次 ——
+  多轮必然死循环。
+- 子进程参数改走**临时文件**（`QODER_RELAY_ARGS_FILE`），不再塞进环境变量。
+  system prompt 加上工具 schema 轻松上万字符，会撞穿 Windows 进程环境块 32767 字符的
+  上限，spawn 直接失败。
 
 ### v0.3.4
 
@@ -277,9 +313,9 @@ curl "http://127.0.0.1:8788/update/check?force=1"   # 忽略缓存
 
 ---
 
-## 14 个模型
+## 15 个模型
 
-`auto`、`deepseek-v4-pro`、`deepseek-flash`、`qwen3.8-max`、`qwen3.8-flash`、
+`auto`、`qoder-auto`、`deepseek-v4-pro`、`deepseek-flash`、`qwen3.8-max`、`qwen3.8-flash`、
 `qwen3.7-max`、`qwen3.7-plus`、`qwen3.7-flash`、`glm-5.3`、`glm-5.3-flash`、
 `glm-5.2`、`kimi-k3`、`kimi-k2.8-preview`、`minimax-m2.7`
 
@@ -388,7 +424,10 @@ foreach($f in @('lib\index.mjs','lib\client.js','server.mjs','shim.mjs','package
 
 ## 已知限制
 
-- **非流式上游 + 分块转发**：CLI 一次性返回完整结果，网关按 64 字符切块成 SSE。首字节延迟 = 完整生成时间。
+- **工具调用是文本协议桥**，不是上游原生 function calling。模型必须按约定格式输出
+  `<tool_call>` 块才会被识别。解析器做了容错（Markdown 围栏、尾随逗号、被切开的标签、
+  流被截断时尽力解析），但模型偶尔仍会不守格式 —— 表现为该调工具却没调、直接把答案
+  写在正文里。提示措辞对这种偏差非常敏感，改动 `buildToolSystemPrompt()` 后务必重测。
 - 每次请求起一个 worker 进程（约 1s 冷启动）。
 - 会话无状态：多轮由网关把 messages 拍平成对话文本。
 - 上游不返回 token 计数，只能用 `qoder_credits` 计量。

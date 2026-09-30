@@ -11,7 +11,8 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -103,12 +104,24 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) 
       return;
     }
 
+    // 参数走临时文件，不走环境变量：system prompt + 工具 schema 轻松上万字符，
+    // 会撞穿 Windows 进程环境块 32767 字符的上限，spawn 直接失败。
+    const argsFile = join(tmpdir(), 'qoder-relay-args-' + process.pid + '-' +
+      randomUUID().replace(/-/g, '').slice(0, 12) + '.json');
+    try {
+      writeFileSync(argsFile, JSON.stringify(cliArgs), 'utf8');
+    } catch (e) {
+      reject(Object.assign(new Error('写参数临时文件失败：' + e.message), { code: 'UPSTREAM_IO' }));
+      return;
+    }
+    const cleanupArgs = () => { try { unlinkSync(argsFile); } catch {} };
+
     const env = {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
       QODER_SDK_ROOT: sdk,
       QODER_WORKER_RUNTIME_ASSET_ROOT: sdk,
-      QODER_RELAY_ARGS: JSON.stringify(cliArgs),
+      QODER_RELAY_ARGS_FILE: argsFile,
       QODERCN_ENTRY: entry || '',
       QODER_RELAY_DEBUG: '0'
     };
@@ -123,6 +136,7 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) 
       if (settled) return;
       settled = true;
       try { child.kill(); } catch {}
+      cleanupArgs();
       reject(Object.assign(new Error('qoder request timeout'), { code: 'UPSTREAM_TIMEOUT' }));
     }, cfg.requestTimeoutMs);
 
@@ -147,12 +161,14 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) 
     child.on('error', e => {
       if (settled) return;
       settled = true; clearTimeout(timer);
+      cleanupArgs();
       reject(Object.assign(new Error('spawn failed: ' + e.message), { code: 'UPSTREAM_IO' }));
     });
 
     child.on('close', code => {
       if (settled) return;
       settled = true; clearTimeout(timer);
+      cleanupArgs();
       resolve({ code, stdout, stderr });
     });
 
@@ -161,6 +177,7 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent }) 
         if (settled) return;
         settled = true; clearTimeout(timer);
         try { child.kill(); } catch {}
+        cleanupArgs();
         reject(Object.assign(new Error('client aborted'), { code: 'CLIENT_ABORT' }));
       }, { once: true });
     }
@@ -317,7 +334,256 @@ function extractResult(events, raw, stderr) {
   };
 }
 
+// ---- 工具调用桥（Harness Tool Bridge）----------------------------------
+//
+// DSH 侧走的是标准 OpenAI function calling：请求带 tools[]，期待响应带 tool_calls[]。
+// 但 Qoder worker CLI 是个自带工具的 agent，它的 --print 协议只吐 thinking/text 块，
+// 没有 function calling 通道。所以在这里架一层文本协议桥：
+//
+//   入方向：把请求里的 tools[] 渲染进 system prompt，约定模型用
+//           <tool_call>{"name":"..","arguments":{..}}</tool_call> 表达调用。
+//   出方向：把该块从正文里剥出来，翻译成 OpenAI 的 tool_calls 增量。
+//
+// 不放过 CLI 自带的工具（--tools default）是刻意的：那会让 Qoder 自己动手改文件，
+// DSH 既拿不到工具卡片，也没有审批与回滚。工具的执行权必须留在 DSH。
+//
+// 实测：deepseek-flash / glm-5.3-flash 都能稳定按此格式输出，也包括 write 这类
+// 带长文本参数的工具。
+
+const TOOL_OPEN = '<tool_call>';
+const TOOL_CLOSE = '</tool_call>';
+const MAX_TOOL_PROMPT_CHARS = 24000;
+const MAX_TOOL_DESC_CHARS = 400;
+const MAX_TOOL_PARAM_DESC_CHARS = 120;
+
+function tryParseJson(s) {
+  if (typeof s !== 'string' || !s) return null;
+  try { return JSON.parse(s); } catch {}
+  // 模型偶尔会留一个尾随逗号
+  try { return JSON.parse(s.replace(/,\s*([}\]])/g, '$1')); } catch {}
+  return null;
+}
+
+/** 精简 JSON Schema：只留模型填参数真正需要的字段，去掉 strict / additionalProperties 之类噪声。 */
+function describeToolParameters(schema, depth = 0) {
+  if (!schema || typeof schema !== 'object' || depth > 6) return {};
+  const out = {};
+  if (schema.type) out.type = schema.type;
+  if (Array.isArray(schema.enum)) out.enum = schema.enum;
+  if (Array.isArray(schema.required)) out.required = schema.required;
+  if (schema.properties && typeof schema.properties === 'object') {
+    out.properties = {};
+    for (const [k, v] of Object.entries(schema.properties)) {
+      const sub = describeToolParameters(v, depth + 1);
+      if (v && typeof v.description === 'string' && v.description.trim()) {
+        sub.desc = v.description.replace(/\s+/g, ' ').trim().slice(0, MAX_TOOL_PARAM_DESC_CHARS);
+      }
+      out.properties[k] = sub;
+    }
+  }
+  if (schema.items) out.items = describeToolParameters(schema.items, depth + 1);
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(schema[key])) out[key] = schema[key].map(s => describeToolParameters(s, depth + 1));
+  }
+  return out;
+}
+
+/** 把 OpenAI 的 tools[] 渲染成一段注入 system prompt 的协议说明。 */
+function buildToolSystemPrompt(tools, toolChoice) {
+  // 措辞必须够硬。实测：只说"你可以调用工具"时，模型会去尝试 Qoder CLI 自带
+  // 的工具链（拿回一堆 Tool not found / MCP 权限报错），然后告诉用户"工具不可用"，
+  // 完全不理会文本协议。必须显式否认原生工具的存在，模型才会老老实实走这个通道。
+  const lines = [
+    '## 工具调用协议（必须遵守）',
+    '',
+    '本环境没有给你注册任何原生函数工具（function tools），也没有可用的 MCP 工具。',
+    '不要尝试以任何其他方式调用工具，那只会失败。你对工具的所有调用都必须用下面的文本块表达。',
+    '',
+    '需要调用工具时，整条回复只允许包含这一个块，前后不要有任何解释文字、也不要包 Markdown 代码围栏：',
+    '',
+    TOOL_OPEN + '{"name":"工具名","arguments":{按参数说明填写}}' + TOOL_CLOSE,
+    '',
+    '宿主会执行该调用，并把结果作为下一条 Tool result 消息回给你，你收到后再继续推理。',
+    '可以直接回答时用自然语言回答，不要输出 ' + TOOL_OPEN + '。',
+    '一次只调用一个工具，arguments 必须是合法 JSON 对象。',
+  ];
+
+  const forced = toolChoice && typeof toolChoice === 'object' ? toolChoice.function?.name : null;
+  if (forced) lines.push('本轮必须调用工具 `' + forced + '`。');
+  else if (toolChoice === 'required') lines.push('本轮必须调用工具，不要直接回答。');
+  else if (toolChoice === 'none') lines.push('本轮不要调用任何工具，直接回答。');
+
+  lines.push('', '### 可用工具', '');
+
+  let budget = MAX_TOOL_PROMPT_CHARS;
+  let included = 0;
+  for (const t of tools) {
+    const fn = t?.function || t;
+    if (!fn || !fn.name) continue;
+    const desc = String(fn.description || '').replace(/\s+/g, ' ').trim().slice(0, MAX_TOOL_DESC_CHARS);
+    const row = '- ' + fn.name + (desc ? ': ' + desc : '') +
+      '\n  参数: ' + JSON.stringify(describeToolParameters(fn.parameters));
+    if (row.length > budget && included > 0) break;
+    budget -= row.length;
+    lines.push(row);
+    included++;
+  }
+  if (included < tools.length) {
+    lines.push('', '（工具清单过长，已省略 ' + (tools.length - included) + ' 个。）');
+  }
+  return lines.join('\n');
+}
+
+/** 把一段 <tool_call> 内容解析成 { name, arguments }。宽松容错，认不出就返回 null。 */
+function parseToolCall(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return null;
+  s = s.replace(/^\`\`\`[a-zA-Z]*\s*/, '').replace(/\`\`\`\s*$/, '').trim();
+
+  let obj = tryParseJson(s);
+  if (!obj) {
+    const a = s.indexOf('{'), b = s.lastIndexOf('}');
+    if (a >= 0 && b > a) obj = tryParseJson(s.slice(a, b + 1));
+  }
+  if (!obj || typeof obj !== 'object') return null;
+
+  const fn = obj.function && typeof obj.function === 'object' ? obj.function : obj;
+  const name = fn.name || fn.tool || fn.tool_name || obj.name || obj.tool;
+  if (!name || typeof name !== 'string') return null;
+
+  let args = fn.arguments ?? fn.args ?? fn.parameters ?? fn.input ?? obj.arguments ?? obj.args ?? obj.parameters ?? {};
+  if (typeof args === 'string') args = tryParseJson(args) ?? { value: args };
+  if (!args || typeof args !== 'object') args = {};
+
+  let json;
+  try { json = JSON.stringify(args); } catch { json = '{}'; }
+  return { name, arguments: json };
+}
+
+/**
+ * 流式工具块提取器。
+ *
+ * 输入是上游正文的任意分片，输出两条通道：
+ *   onText(s)                     —— 可以安全发出去的正文（工具块已剥掉）
+ *   onToolCall({name,arguments})  —— 解析完成的工具调用
+ *
+ * 三处关键处理：
+ *  1. 标签可能被切在分片中间，所以尾部若是 TOOL_OPEN 的前缀就先扣住不发；
+ *  2. 工具块前后的空白一并吞掉，避免 DSH 正文里出现空行；
+ *  3. 同一调用（name + arguments 签名）只发一次 —— 有的模型会在思考里先写一遍。
+ */
+function createToolCallExtractor({ onText, onToolCall }) {
+  let tail = '';       // 扣住的半截标签
+  let inBlock = false;
+  let body = '';
+  let hold = '';       // 尾部未定空白
+  let textOut = '';
+  const calls = [];
+  const seen = new Set();
+
+  const pushText = (s) => { if (!s) return; textOut += s; onText(s); };
+
+  const emitWithheld = (s) => {
+    const merged = hold + s;
+    const m = /[ \t\r\n]*$/.exec(merged);
+    hold = m ? m[0] : '';
+    const head = merged.slice(0, merged.length - hold.length);
+    if (head) pushText(head);
+  };
+
+  const emitCall = (raw) => {
+    const call = parseToolCall(raw);
+    if (!call) return;
+    const sig = call.name + '\u0000' + call.arguments;
+    if (seen.has(sig)) return;
+    seen.add(sig);
+    calls.push(call);
+    onToolCall(call);
+  };
+
+  const feed = (chunk) => {
+    if (!chunk) return;
+    let s = tail + chunk;
+    tail = '';
+    for (;;) {
+      if (!s) return;
+      if (inBlock) {
+        const idx = s.indexOf(TOOL_CLOSE);
+        if (idx < 0) { body += s; return; }
+        body += s.slice(0, idx);
+        s = s.slice(idx + TOOL_CLOSE.length);
+        inBlock = false;
+        const raw = body;
+        body = '';
+        emitCall(raw);
+        continue;
+      }
+      const idx = s.indexOf(TOOL_OPEN);
+      if (idx >= 0) {
+        emitWithheld(s.slice(0, idx));
+        hold = '';
+        s = s.slice(idx + TOOL_OPEN.length);
+        inBlock = true;
+        continue;
+      }
+      let keep = 0;
+      const max = Math.min(TOOL_OPEN.length - 1, s.length);
+      for (let n = max; n > 0; n--) {
+        if (s.endsWith(TOOL_OPEN.slice(0, n))) { keep = n; break; }
+      }
+      emitWithheld(s.slice(0, s.length - keep));
+      tail = keep ? s.slice(s.length - keep) : '';
+      return;
+    }
+  };
+
+  const flush = () => {
+    if (inBlock) {
+      const raw = body;
+      body = '';
+      inBlock = false;
+      if (raw.trim()) emitCall(raw);   // 流被截断：尽力解析已攒到的内容
+    }
+    if (tail) { emitWithheld(tail); tail = ''; }
+    if (hold) { pushText(hold); hold = ''; }
+  };
+
+  return {
+    feed,
+    flush,
+    get calls() { return calls; },
+    get text() { return textOut; }
+  };
+}
+
 // ---- 把 OpenAI messages 压成单条 prompt ----
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map(c => {
+    if (typeof c === 'string') return c;
+    if (!c) return '';
+    if (c.type === 'text' || c.type === 'input_text') return c.text || '';
+    if (c.type === 'image_url' || c.type === 'input_image') return '[图片已省略]';
+    return '';
+  }).join('');
+}
+
+/** 回放历史里的 tool_calls：还原成模型自己写过的 <tool_call> 格式，保持协议一致。 */
+function renderToolCalls(toolCalls) {
+  const parts = [];
+  for (const tc of toolCalls) {
+    if (!tc) continue;
+    const fn = tc.function && typeof tc.function === 'object' ? tc.function : tc;
+    const name = fn.name || tc.name || '';
+    if (!name) continue;
+    let args = fn.arguments ?? tc.arguments ?? {};
+    if (typeof args === 'string') args = tryParseJson(args) ?? {};
+    parts.push(TOOL_OPEN + JSON.stringify({ name, arguments: args }) + TOOL_CLOSE);
+  }
+  return parts.join('\n');
+}
+
 function flattenMessages(messages, systemFromField) {
   const sysParts = [];
   if (systemFromField) sysParts.push(String(systemFromField));
@@ -325,17 +591,30 @@ function flattenMessages(messages, systemFromField) {
   const convo = [];
   for (const m of messages || []) {
     const role = m.role || 'user';
-    let text = '';
-    if (typeof m.content === 'string') text = m.content;
-    else if (Array.isArray(m.content)) {
-      text = m.content.map(c => {
-        if (typeof c === 'string') return c;
-        if (c.type === 'text') return c.text || '';
-        if (c.type === 'input_text') return c.text || '';
-        return '';
-      }).join('');
-    }
+    const text = contentToText(m.content).trim();
+
     if (role === 'system' || role === 'developer') { if (text) sysParts.push(text); continue; }
+
+    // 工具返回结果（OpenAI role:"tool"）。必须带上调用标识 —— 否则模型看到的就是
+    // 一条普通 User 消息，会以为用户凭空说了句话，于是把同一个工具再调一次。
+    if (role === 'tool' || role === 'function') {
+      const id = m.tool_call_id || m.name || '';
+      const head = id ? '（调用 ' + id + ' 的返回结果）' : '（工具返回结果）';
+      convo.push({ role: 'tool', text: head + '\n' + (text || '(空)') });
+      continue;
+    }
+
+    if (role === 'assistant') {
+      const parts = [];
+      if (text) parts.push(text);
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        const rendered = renderToolCalls(m.tool_calls);
+        if (rendered) parts.push(rendered);
+      }
+      if (parts.length) convo.push({ role: 'assistant', text: parts.join('\n') });
+      continue;
+    }
+
     if (text) convo.push({ role, text });
   }
 
@@ -344,7 +623,7 @@ function flattenMessages(messages, systemFromField) {
   else if (convo.length === 1 && convo[0].role === 'user') prompt = convo[0].text;
   else {
     prompt = convo.map(m => {
-      const label = m.role === 'assistant' ? 'Assistant' : 'User';
+      const label = m.role === 'assistant' ? 'Assistant' : (m.role === 'tool' ? 'Tool result' : 'User');
       return label + ': ' + m.text;
     }).join('\n\n');
   }
@@ -877,8 +1156,20 @@ const server = http.createServer(async (req, res) => {
     catch { return json(res, 400, { error: { message: 'invalid json body' } }); }
 
     const model = resolveModel(body.model);
-    const { prompt, systemPrompt } = flattenMessages(body.messages, body.system);
+    const tools = Array.isArray(body.tools)
+      ? body.tools.filter(t => t && (t.function?.name || t.name))
+      : [];
+    const flat = flattenMessages(body.messages, body.system);
+    const prompt = flat.prompt;
     if (!prompt) return json(res, 400, { error: { message: 'no user content in messages' } });
+
+    // 有工具就走协议桥：把 tools[] 渲染进 system prompt，出方向再把 <tool_call>
+    // 翻译成真正的 tool_calls。没有工具时一切照旧，纯对话行为不变。
+    let systemPrompt = flat.systemPrompt;
+    if (tools.length) {
+      const bridge = buildToolSystemPrompt(tools, body.tool_choice);
+      systemPrompt = systemPrompt ? systemPrompt + '\n\n' + bridge : bridge;
+    }
 
     const entry = resolveEntry(body);
     const id = 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 24);
@@ -897,6 +1188,7 @@ const server = http.createServer(async (req, res) => {
     // 因此 contentIndex 的推进天然正确，不需要人工重排。
     let agg = null;
     let sseOpen = false;
+    let toolCallIndex = 0;
     const openSse = () => {
       if (sseOpen) return;
       sseOpen = true;
@@ -908,17 +1200,40 @@ const server = http.createServer(async (req, res) => {
       });
     };
 
+    const sseChunk = (delta) => {
+      openSse();
+      sseSend(res, {
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta, finish_reason: null }]
+      });
+    };
+
+    // 一条工具调用一次性发全：id + name + 完整 arguments。
+    // 上游是块级输出，工具块闭合时参数已经完整，再切分片只会多一层出错面。
+    const sendToolCall = (call) => {
+      sseChunk({
+        tool_calls: [{
+          index: toolCallIndex++,
+          id: 'call_' + randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'function',
+          function: { name: call.name, arguments: call.arguments }
+        }]
+      });
+    };
+
+    const extractor = createToolCallExtractor({
+      onText: (s) => sseChunk({ content: s }),
+      onToolCall: sendToolCall
+    });
+
     const onEvent = (e) => {
       if (!agg) return;
       agg.feed(e);
     };
     const onDelta = (kind, chunk) => {
-      openSse();
-      const delta = kind === 'thinking' ? { reasoning_content: chunk } : { content: chunk };
-      sseSend(res, {
-        id, object: 'chat.completion.chunk', created, model,
-        choices: [{ index: 0, delta, finish_reason: null }]
-      });
+      // 思考链直接透传：实测上游不会把工具调用写进 thinking 块，只在正文块里输出。
+      if (kind === 'thinking') return sseChunk({ reasoning_content: chunk });
+      extractor.feed(chunk);
     };
     if (stream) agg = createBlockAggregator(onDelta);
 
@@ -980,13 +1295,23 @@ const server = http.createServer(async (req, res) => {
     const nonStreamReasoning = !(cfg.exposeReasoning === false || cfg.exposeReasoning === 'never');
 
     if (!stream) {
-      const message = { role: 'assistant', content: outcome.text };
+      const ex = createToolCallExtractor({ onText() {}, onToolCall() {} });
+      ex.feed(outcome.text);
+      ex.flush();
+      const message = { role: 'assistant', content: ex.text };
+      if (ex.calls.length) {
+        message.tool_calls = ex.calls.map(c => ({
+          id: 'call_' + randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'function',
+          function: { name: c.name, arguments: c.arguments }
+        }));
+      }
       // 只有开启 thinking 的路由才带：非推理模型（如 deepseek-flash）返回空串，
       // 挂了反而让下游以为「有思考但为空」。
       if (nonStreamReasoning && outcome.reasoning) message.reasoning_content = outcome.reasoning;
       return json(res, 200, {
         id, object: 'chat.completion', created, model,
-        choices: [{ index: 0, message, finish_reason: 'stop' }],
+        choices: [{ index: 0, message, finish_reason: ex.calls.length ? 'tool_calls' : 'stop' }],
         usage
       });
     }
@@ -1006,17 +1331,14 @@ const server = http.createServer(async (req, res) => {
           });
         }
       }
-      for (let i = 0; i < outcome.text.length; i += CHUNK) {
-        sseSend(res, {
-          id, object: 'chat.completion.chunk', created, model,
-          choices: [{ index: 0, delta: { content: outcome.text.slice(i, i + CHUNK) }, finish_reason: null }]
-        });
-      }
+      // 走同一条提取器：这段兜底正文里同样可能裹着工具块
+      extractor.feed(outcome.text);
     }
+    extractor.flush();
 
     sseSend(res, {
       id, object: 'chat.completion.chunk', created, model,
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      choices: [{ index: 0, delta: {}, finish_reason: toolCallIndex > 0 ? 'tool_calls' : 'stop' }],
       usage
     });
     res.write('data: [DONE]\n\n');
