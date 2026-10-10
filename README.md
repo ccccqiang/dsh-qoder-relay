@@ -61,8 +61,17 @@ clone 到本地后把依赖写成：
 
 ### 启用模型路由
 
-装完插件后，还要让 DSH 知道怎么用它。
-在 `$DSH_HOME/profiles/desktop/cordis.patch.yml` 的 `llm-pi-ai` 行里加一个 provider：
+**v0.4.2 起可以点按钮：装好插件完全重启 DSH 后，进「设置 → Qoder CN → 模型路由」，
+点一下「接入模型路由」就完事。** 下面是手工方式和这个按钮实际做的事。
+
+背景：网关装好会自己跑起来，但 **DSH 不会自动发现网关的模型** —— 它只认显式声明。
+你要在 profile 层写一次 provider，模型才会出现在「设置 → 模型」和模型选择器里。
+
+文件（Windows）：`C:\Users\<你的用户名>\.dsh\profiles\desktop\cordis.patch.yml`
+
+#### 情况 A：文件里还没有 `llm-pi-ai` 这一行
+
+整块复制进去：
 
 ```yaml
 - id: llm-pi-ai
@@ -76,26 +85,133 @@ clone 到本地后把依赖写成：
         apiKeyEnv: QODER_RELAY_KEY
         models:
           - id: auto
+            name: Auto
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: qoder-auto
             name: Qoder Auto
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: deepseek-v4-pro
+            name: DeepSeek-V4-Pro
+            contextWindow: 200000
+            maxTokens: 65536
           - id: deepseek-flash
-            name: DeepSeek Flash (Qoder)
+            name: DeepSeek-Flash
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: qwen3.8-max
+            name: Qwen3.8-Max
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: qwen3.8-flash
+            name: Qwen3.8-Flash
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: qwen3.7-max
+            name: Qwen3.7-Max
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: qwen3.7-plus
+            name: Qwen3.7-Plus
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: qwen3.7-flash
+            name: Qwen3.7-Flash
+            contextWindow: 200000
+            maxTokens: 65536
           - id: glm-5.3
-            name: GLM-5.3 (Qoder)
-          # …其余模型见「15 个模型」一节
+            name: GLM-5.3
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: glm-5.3-flash
+            name: GLM-5.3-Flash
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: glm-5.2
+            name: GLM-5.2
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: kimi-k3
+            name: Kimi-K3
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: kimi-k2.8-preview
+            name: Kimi-K2.8-Preview
+            contextWindow: 200000
+            maxTokens: 65536
+          - id: minimax-m2.7
+            name: MiniMax-M2.7
+            contextWindow: 200000
+            maxTokens: 65536
 ```
 
-再往 `$DSH_HOME/.credentials.yaml` 加一行（网关默认不校验，占位值即可）：
+#### 情况 B：已经有 `llm-pi-ai` 行（比如你还接了别家中转站）
+
+**不要把整行替换掉。** 同一个 `id` 的行是**整体覆盖**而不是合并 —— 你原有的 provider 会一起消失。
+只把 `qoder:` 这一段加到现有 `providers:` 底下，缩进和兄弟节点对齐：
+
+```yaml
+    providers:
+      cun:                    # 你原来就有的，别动
+        displayName: ...
+        models: ...
+      qoder:                  # ← 新增这一段
+        displayName: Qoder CN
+        api: openai-completions
+        baseURL: http://127.0.0.1:8788/v1
+        apiKeyEnv: QODER_RELAY_KEY
+        models:
+          - id: auto
+            name: Auto
+            contextWindow: 200000
+            maxTokens: 65536
+          # …其余 14 个同上
+```
+
+> 模型 id **必须逐字照抄**，不能改大小写：`qwen3.8-max` 不是 `Qwen3.8-max`。
+> 想确认网关到底暴露了哪些，直接问它：`curl http://127.0.0.1:8788/v1/models`
+
+#### 加凭证
+
+也在 profile 目录旁边，`$DSH_HOME/.credentials.yaml`：
 
 ```yaml
 refs:
   QODER_RELAY_KEY: qoder-relay-local
 ```
 
-> **这条路由必须留在 profile 层。** 搬到 home 层会让「设置 → 模型」那页变空壳。
+网关默认不校验 key，值填什么都行 —— 但它**必须存在**。缺了会以 `MISSING_CREDENTIAL` 报错，
+现象是模型能选中、一发消息就失败。
+
+#### 重启
+
+**完全退出 DSH Desktop（托盘图标右键退出），再打开。** profile patch 只在启动时读一次，
+不重启的话运行中的进程还是旧配置。
+
+> **这条路由必须留在 profile 层。** 搬到 `$DSH_HOME/cordis.patch.yml`（home 层）会让
+> 「设置 → 模型」那页变成空壳 —— 它只从 profile 层读取，而 home 层会**整体遮住** profile 层的那一行。
 
 ---
 
 ## 更新日志
+
+### v0.4.2
+
+**设置页多了一个「接入模型路由」按钮 —— 不用再手抄那段 60 行的 yaml 了。**
+
+- **背景**：DSH 不会自动发现网关上的模型，必须在 profile 层显式声明 provider。
+  原来只能手抄，15 个模型 × 4 行，而且同一个 `id` 的行是**整体覆盖**不是合并 ——
+  用户照抄时很容易把自己别家中转站的 provider 一起冲掉。
+- **现在**：插件读网关的 `/v1/models` 拿到真实模型列表，走 DSH 官方的 `settings.mutate`
+  （就是「设置 → 模型」页自己用的那条路）把 `providers.qoder` 写进去。
+  ops 是路径寻址的 —— `applyPathOp` 只改 path 指到的那一个键，兄弟 provider 一个字节都不动。
+- **凭证顺手补上**：`QODER_RELAY_KEY` 缺失时写一个占位值（网关不校验 key，
+  但 `llm-pi-ai` 解析不到这个引用会抛 `MISSING_CREDENTIAL`，表现为能选中模型、一发消息就失败）。
+- **边界都做了保护**：`providers.qoder` 已存在时默认拒绝覆盖，要显式确认；
+  写入前取 revision 做乐观锁，你在模型页同时编辑会被拒绝而不是被盖掉；
+  网关没起来、`llm-pi-ai` 行不存在、`describe()` 返回异常值，都降级成清楚提示而不是抛异常。
+- 手工方式仍然有效，见「启用模型路由」一节。
 
 ### v0.4.1
 
@@ -387,6 +503,9 @@ curl "http://127.0.0.1:8788/update/check?force=1"   # 忽略缓存
 - **状态**：真正跑一次 `--list-models` 判定可用性（不靠猜），区分「找不到安装」和「未登录」
 - **模型**：列出当前账号可用的全部模型
 - **网关地址**：显示 OpenAI 兼容端点，方便接其他客户端
+- **模型路由**：一键把网关的模型写进 profile 配置 —— 走 DSH 官方的 `settings.mutate`，
+  只改 `providers.qoder` 这一项，不动你已有的其他 provider。已存在时默认不覆盖。
+  改完重启 DSH，模型就出现在选择器里。
 
 ---
 
