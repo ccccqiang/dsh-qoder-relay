@@ -15,6 +15,7 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { discoverElectron, discoverSdkRoot } from './lib/discover.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CFG_PATH = join(__dirname, 'config.json');
@@ -694,45 +695,14 @@ function flattenMessages(messages, systemFromField) {
 let loginSession = null;
 
 /**
- * 探测 Qoder CN 安装位置。
+ * 探测 Qoder CN 安装位置与 worker runtime 根目录。
  *
- * 顺序：显式配置 → 环境变量 → 常见安装点（各盘符 / Program Files / LOCALAPPDATA）。
- * 任何人 clone 下来都不该需要手改路径 —— 只有装在非常规位置才需要 config.json。
+ * 实现搬到 lib/discover.mjs，与 host 半边共用 —— 这两份曾经各写一遍且已经
+ * 漂移（host 那份只认 C:/D:，这份认 C-F）。漂移的代价是装在 E 盘时 host
+ * 先失败、网关根本起不来。这里保留同名薄包装，调用点不用改。
  */
-function findElectron() {
-  const home = process.env.USERPROFILE || process.env.HOME || "";
-  const drives = ["C", "D", "E", "F"];
-  const candidates = [
-    cfg.electronExe,
-    process.env.QODER_ELECTRON_EXE,
-    // 各常见盘符的同名目录
-    ...drives.flatMap((d) => [
-      d + ":\\Qoder CN\\Qoder CN.exe",
-      d + ":\\Qoder\\Qoder CN.exe",
-      d + ":\\Program Files\\Qoder CN\\Qoder CN.exe",
-      d + ":\\Program Files (x86)\\Qoder CN\\Qoder CN.exe"
-    ]),
-    // 用户级安装
-    process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Programs", "Qoder CN", "Qoder CN.exe") : "",
-    process.env.ProgramFiles ? join(process.env.ProgramFiles, "Qoder CN", "Qoder CN.exe") : "",
-    process.env["ProgramFiles(x86)"] ? join(process.env["ProgramFiles(x86)"], "Qoder CN", "Qoder CN.exe") : "",
-    home ? join(home, "AppData", "Local", "Programs", "Qoder CN", "Qoder CN.exe") : ""
-  ].filter(Boolean);
-
-  for (const c of candidates) {
-    try { if (existsSync(c)) return c; } catch { /* 无效路径跳过 */ }
-  }
-  return null;
-}
-
-function findSdkRoot(exe) {
-  if (process.env.QODER_SDK_ROOT && existsSync(process.env.QODER_SDK_ROOT)) return process.env.QODER_SDK_ROOT;
-  if (cfg.sdkRoot && existsSync(cfg.sdkRoot)) return cfg.sdkRoot;
-  if (!exe) return null;
-  const base = join(dirname(exe), "resources", "app.asar.unpacked",
-    "node_modules", "@qoder-ai", "qoder-cn-agent-sdk", "dist", "_worker");
-  return existsSync(base) ? base : null;
-}
+const findElectron = () => discoverElectron(cfg);
+const findSdkRoot = (exe) => discoverSdkRoot(exe, cfg);
 
 /** 跑一次 CLI 并收集输出。 */
 function runCli(args, timeoutMs) {

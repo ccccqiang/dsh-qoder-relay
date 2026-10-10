@@ -97,6 +97,23 @@ refs:
 
 ## 更新日志
 
+### v0.4.1
+
+**装在 E 盘 / F 盘等非常规盘符的用户修好了 —— 之前 host 半边根本认不出安装位置。**
+
+- **探测逻辑合并成一份**。原先 `lib/index.mjs` 和 `server.mjs` 各写了一遍安装位置探测，
+  且已经漂移：host 那份只认 `C:` `D:` 前缀，网关那份认 `C`-`F`。装在 E 盘时，
+  host 先探测失败就**直接放弃拉起网关** —— 而网关自己本来认得 E 盘，根本没机会运行，
+  用户只看到「找不到 Qoder CN 安装位置」。现在两处共用 `lib/discover.mjs`，盘符 A-Z 全枚举，
+  这类漂移从结构上消失。
+- **`config.json` 不再形同虚设**。它一直被 `config.example.json` 暗示存在、`server.mjs` 也一直在读，
+  但 host 半边从来没读过 —— 于是形成死锁：host 探测失败 → 不启动 server → server 永远读不到
+  `config.json` → host 下次依旧失败。现在 host 也读它，优先级 `cordis 注入 > config.json > 默认值`，
+  且空字符串不会覆盖下层配置。
+- **报错能照着做了**。原来只有一句「找不到 Qoder CN 安装位置」；现在直接列出三种指定方式，
+  并给出可原样粘进 `config.json` 的 JSON 片段。
+- 顺带统一了 `sdkRoot` 的探测顺序（显式配置 → 环境变量 → 从 exe 推导）。
+
 ### v0.4.0
 
 **模型现在能调用 DSH 的工具了 —— 读写文件、执行命令、检索代码，跟别的模型一样。**
@@ -417,6 +434,7 @@ DSH ──挂载──> dsh-qoder-relay
 | `lib/index.mjs` | host 入口：网关生命周期 + `qoderRelay` 服务（登录控制） |
 | `lib/client.js` | 浏览器入口：设置页 React 组件 |
 | `server.mjs` | OpenAI 兼容网关 |
+| `lib/discover.mjs` | 安装位置探测：host 与网关共用的**唯一**一份实现（v0.4.1 起） |
 | `shim.mjs` | 以 Electron-as-Node 启动 Qoder worker；参数经 `QODER_RELAY_ARGS`(JSON) 传入 |
 | `cordis.patch.yml` | 一行 insert，让插件管理器能按 id 定位并开关 |
 
@@ -473,7 +491,7 @@ foreach($f in @('lib\index.mjs','lib\client.js','server.mjs','shim.mjs','package
 | 症状 | 修法 |
 |---|---|
 | 设置里没有 Qoder CN tab | 重启 DSH；确认 `dsh.client` 声明在（见 package.json） |
-| 状态显示「找不到 Qoder CN 安装目录」 | 装 Qoder CN，或在插件 config 里给 `electronExe` |
+| 状态显示「找不到 Qoder CN 安装位置」 | 先确认已装 Qoder CN。v0.4.1 起各盘符（A-Z）自动枚举；仍找不到就在插件目录建 `config.json`，写 `{"electronExe":"E:/Qoder CN/Qoder CN.exe"}` |
 | 状态显示「未登录」 | 点「登录 Qoder」，浏览器完成授权 |
 | 模型是死的，请求超时 | 看 `:8788` 是否 LISTEN；检查插件开关 |
 | 退出 DSH 后 `:8788` 还被占 | `taskkill /PID <pid> /T /F` |
