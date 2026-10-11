@@ -85,7 +85,7 @@ function resolveEntry(req) {
 }
 
 // ---- 调用 Qoder CLI，返回事件流 ----
-function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent, reasoningEffort, maxOutputTokens }) {
+function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent, reasoningEffort, maxOutputTokens, attachments }) {
   return new Promise((resolve, reject) => {
     // 控制台里必须没有第二个工具通道。
     //
@@ -127,6 +127,8 @@ function runQoder({ prompt, model, cwd, systemPrompt, entry, signal, onEvent, re
     );
     if (ENABLE_REASONING_EFFORT && reasoningEffort) cliArgs.push('--reasoning-effort', String(reasoningEffort));
     if (maxOutputTokens) cliArgs.push('--max-output-tokens', String(maxOutputTokens));
+    // 图片走 CLI 自己的附件通道：实测模型能看到图（写着 42 的图能答出 42）。
+    if (Array.isArray(attachments)) for (const a of attachments) cliArgs.push('--attachment', a);
     if (cwd) cliArgs.push('-w', cwd);
     if (systemPrompt) cliArgs.push('--system-prompt', systemPrompt);
 
@@ -723,6 +725,40 @@ function messagesHaveImage(messages) {
   return (messages || []).some(m => contentHasImage(m && m.content));
 }
 
+/**
+ * 把请求里的图片块落成临时文件，返回路径列表（调用方负责清理）。
+ *
+ * Qoder CLI 有 --attachment <file>，实测能把图片交给上游 —— Qwen3.8-Flash 看一张写着
+ * "42" 的图能准确答出 42。所以图片不是"通道不支持"，只是要换个传法：
+ * 原来 contentToText() 会把它压成占位符，等于把图扔了。
+ * 支持的格式：data:image/...;base64,...。远程 http(s) URL 跳过 —— 上游未必取得到，
+ * 静默失败比不传更糟。
+ */
+function extractImageAttachments(messages) {
+  const files = [];
+  for (const m of messages || []) {
+    if (!Array.isArray(m.content)) continue;
+    for (const c of m.content) {
+      if (!c || typeof c !== 'object') continue;
+      let url = null;
+      if (c.type === 'image_url' && c.image_url && typeof c.image_url === 'object') url = c.image_url.url;
+      else if (c.type === 'image_url' && typeof c.image_url === 'string') url = c.image_url;
+      else if (c.type === 'input_image' && typeof c.image_url === 'string') url = c.image_url;
+      if (typeof url !== 'string' || !url) continue;
+      const mm = /^data:image\/([a-zA-Z0-9+.-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(url);
+      if (!mm) continue;
+      let buf;
+      try { buf = Buffer.from(mm[2].replace(/\s+/g, ''), 'base64'); } catch { continue; }
+      if (!buf || !buf.length) continue;
+      const ext = mm[1].toLowerCase() === 'jpeg' ? 'jpg' : mm[1].toLowerCase();
+      const file = join(tmpdir(), 'qoder-relay-img-' + process.pid + '-' +
+        randomUUID().replace(/-/g, '').slice(0, 12) + '.' + ext);
+      try { writeFileSync(file, buf); files.push(file); } catch { /* 落盘失败就当没有 */ }
+    }
+  }
+  return files;
+}
+
 function contentToText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -1292,18 +1328,9 @@ const server = http.createServer(async (req, res) => {
 
     const model = resolveModel(body.model);
 
-    // 纯文本通道：输入最终是 CLI 的 `-p <prompt>`，没有任何多模态入口。
-    // 与其把图片悄悄压成占位符、让模型对着看不见的图说"读过了"，不如直接拒绝 ——
-    // 这也是 DSH 里其他纯文本模型的表现（pi-ai 层同样抛 UNSUPPORTED_CONTENT）。
-    if (messagesHaveImage(body.messages)) {
-      return json(res, 400, {
-        error: {
-          message: 'qoder-relay model "' + model + '" does not support image input',
-          type: 'unsupported_content',
-          code: 'UNSUPPORTED_CONTENT'
-        }
-      });
-    }
+    // 图片：落成临时文件走 CLI 的 --attachment（实测模型真能看到图）。
+    // 早期版本把图片压成占位符、后来干脆 400 拒绝，都是因为漏掉了 CLI 这个参数。
+    const attachments = extractImageAttachments(body.messages);
 
     const tools = Array.isArray(body.tools)
       ? body.tools.filter(t => t && (t.function?.name || t.name))
@@ -1317,7 +1344,9 @@ const server = http.createServer(async (req, res) => {
     const maxOutputTokens = Number.isFinite(maxTokensRaw) && maxTokensRaw > 0 ? Math.floor(maxTokensRaw) : 0;
 
     const flat = flattenMessages(body.messages, body.system);
-    const prompt = flat.prompt;
+    let prompt = flat.prompt;
+    // 只发了图、没带文字时给一句兜底，否则会被当成空请求拒掉
+    if (!prompt && attachments.length) prompt = '请看附件里的图片。';
     if (!prompt) return json(res, 400, { error: { message: 'no user content in messages' } });
 
     // 有工具就走协议桥：把 tools[] 渲染进 system prompt，出方向再把 <tool_call>
@@ -1398,7 +1427,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const { stdout, stderr } = await runQoder({
         prompt, model, cwd: body.cwd, systemPrompt, entry, signal: ac.signal,
-        onEvent, reasoningEffort, maxOutputTokens
+        onEvent, reasoningEffort, maxOutputTokens, attachments
       });
       outcome = extractResult(parseEvents(stdout), stdout, stderr);
       // 聚合器与 extractResult 不一致时，以聚合器为准（它看到的是真实到达顺序）
@@ -1415,6 +1444,9 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
       return json(res, 502, { error: { message: msg, type: e.code || 'upstream_error' } });
+    } finally {
+      // 附件是临时文件，无论成败都要清掉，别在 %TEMP% 里攒
+      for (const f of attachments) { try { unlinkSync(f); } catch {} }
     }
 
     if (outcome.isError) {

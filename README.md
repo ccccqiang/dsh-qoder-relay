@@ -196,6 +196,38 @@ refs:
 
 ## 更新日志
 
+### v0.4.5
+
+**图片能用了 —— 之前的判断是错的，通道其实支持。**
+
+早期版本把图片块压成占位符，后来又改成用 `unsupported_content` 拒掉整条请求，理由是
+「网关最终是 CLI 的 `-p <prompt>`，没有多模态入口」。**这个理由漏了一个参数**：CLI 有
+`--attachment <file>`（`--help` 里一直写着）。实测 Qoder CLI 1.1.35：让 Qwen3.8-Flash
+看一张写着 "42" 的图，它准确答出 42。
+
+改动：
+
+- 请求里的图片块（`data:image/...;base64,...`）落成临时文件，经 `--attachment` 传给 CLI；
+  请求结束后无论成败都清掉（实测残留 0）。
+- 远程 `http(s)` 图片 URL 跳过 —— 上游未必取得到，静默失败比不传更糟。
+- 只发图、不带文字时补一句兜底 prompt，否则会被当成空请求拒掉。
+
+**逐个模型实测了视觉能力**（同一张写着 42 的图，问它看见什么数字）：
+
+| 结果 | 模型 |
+|---|---|
+| 支持 | Qwen3.8-Max、Qwen3.8-Flash、Qwen3.7-Max、Qwen3.7-Plus、Qwen3.7-Flash、DeepSeek-V4-Pro、DeepSeek-Flash、GLM-5.3、GLM-5.3-Flash、GLM-5.2、Kimi-K3、Kimi-K2.8-Preview、Auto |
+| 不支持 | **MiniMax-M2.7** —— 上游明确回「当前模型不支持查看图片文件」 |
+
+（`qoder-auto` 和 `auto` 是同一个上游模型，一并算支持。）
+
+profile 里据此给这 14 个模型声明了 `input: [text, image]`，MiniMax-M2.7 保持 `[text]`；
+provider 级 `defaultInput` 仍是 `[text]`，新加的模型默认按纯文本处理，要开图片得显式写。
+
+> 这跟第三方实现 `@jischeng/pi-provider-qoder` 的表**不一致** —— 那张表标 DeepSeek-V4-Pro、
+> Qwen3.7-Plus 等只支持 text。差异来自通道：那张表走官方 openapi，我们走 CLI 的
+> `--attachment`，后者对所有模型都能传。**以实测为准。**
+
 ### v0.4.4
 
 **修掉「模型只会思考、不动手」的第二个根因：历史里的 DSML 污染。**
