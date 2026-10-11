@@ -196,6 +196,35 @@ refs:
 
 ## 更新日志
 
+### v0.4.7
+
+**DSH 底部那两个 0 动起来了** —— 上游不给 token 计数，但里面有两个真实值之前被丢掉了。
+
+实测 `result` 事件（`--output-format stream-json` 的最后一条）：
+
+```json
+"usage": { "input_tokens": 0, "output_tokens": 0, "context_usage_ratio": 0.156 },
+"total_credits": 0.0939,
+"duration_ms": 1580
+```
+
+**`input_tokens` / `output_tokens` 确实是 0** —— 上游就是不返回 token 计数，这条老结论
+没错。但同一条事件里有两样能用、之前没取的东西：
+
+- **`context_usage_ratio`** —— 真实的上下文占用比例。乘以我们声明的窗口就是本次上下文的
+  规模（实测 0.156 × 200000 ≈ 31k，与 CLI 自带 system 的体量相符）。现在用它填
+  `prompt_tokens`。
+- **`duration_ms`** —— 真实耗时，透出成 `qoder_duration_ms`。
+
+输出侧没有等价字段，只能按字符估（CJK 一字算一个、其余每 4 字符算一个）填
+`completion_tokens`。**DSH 底部的 tok/s 算法是 `outputTokens / 生成秒数`，没有这个数
+就永远是 0**，所以宁可给一个诚实的估计值 —— 反正它只是给 UI 一个好读数。
+
+usage 里另外挂了三个字段说明来源：`qoder_context_ratio`、`qoder_duration_ms`
+（两者是上游真值）、`qoder_tokens_estimated: true`（明说 token 数是估的）。
+
+> **计量仍然只看 `qoder_credits`。** 它是上游直接下发的真实扣费，跟 token 估值无关。
+
 ### v0.4.6
 
 **设置页的「接入模型路由」现在也会勾上图片能力 —— 之前它会把图片那一栏抹掉。**

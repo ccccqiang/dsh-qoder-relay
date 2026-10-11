@@ -348,6 +348,9 @@ function extractResult(events, raw, stderr) {
       reasoning: thinking,
       credits,
       usage,
+      // 上游不给 token 计数，但给了上下文占用比例和耗时 —— 这两个是真实值
+      contextRatio: typeof usage.context_usage_ratio === 'number' ? usage.context_usage_ratio : null,
+      durationMs: typeof result.duration_ms === 'number' ? result.duration_ms : null,
       isError: !!result.is_error,
       subtype: result.subtype
     };
@@ -477,6 +480,26 @@ function rewriteDsml(text) {
   return (rest ? rest + '\n' : '') + rendered;
 }
 
+
+/**
+ * 粗略估 token —— 只为了给 UI 一个能动的读数，不是计量依据。
+ *
+ * 上游不返回 token 计数（实测 result.usage.input_tokens / output_tokens 恒为 0），
+ * 而 DSH 底部的 tok/s = outputTokens / 生成秒数，没有它就是 0。
+ * 规则：CJK 一字算一个，其余每 4 字符算一个。
+ */
+function estimateTokens(s) {
+  const t = String(s || '');
+  if (!t) return 0;
+  let cjk = 0;
+  for (const ch of t) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0x3040 && c <= 0x30ff) || (c >= 0x3400 && c <= 0x4dbf) ||
+        (c >= 0x4e00 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff) ||
+        (c >= 0xff00 && c <= 0xffef)) cjk++;
+  }
+  return cjk + Math.ceil((t.length - cjk) / 4);
+}
 
 function tryParseJson(s) {
   if (typeof s !== 'string' || !s) return null;
@@ -1461,14 +1484,26 @@ const server = http.createServer(async (req, res) => {
     }
 
     const u = outcome.usage || {};
-    const pt = u.input_tokens ?? 0;
-    const ct = u.output_tokens ?? 0;
+    // 上游的 input_tokens / output_tokens 恒为 0（实测），但不能就此让 UI 显示 0 ——
+    // DSH 底部的 tok/s 与占用百分比都从这两个数算。
+    //
+    // 输入侧有真实依据：result.usage.context_usage_ratio 是上下文占用比例，
+    // 乘以我们声明的窗口就是本次上下文规模的估计（实测 0.156 × 200000 ≈ 31k，
+    // 与 CLI 自带 system 的体量相符）。
+    // 输出侧上游没有等价字段，只能按字符估 —— 标记 qoder_tokens_estimated 说明这一点。
+    const CTX_WINDOW = 200000;
+    const ratio = typeof outcome.contextRatio === 'number' ? outcome.contextRatio : null;
+    const pt = ratio !== null ? Math.round(ratio * CTX_WINDOW) : (u.input_tokens ?? 0);
+    const ct = estimateTokens(outcome.text) + estimateTokens(outcome.reasoning);
     const usage = {
       prompt_tokens: pt,
       completion_tokens: ct,
       total_tokens: pt + ct,
       qoder_credits: outcome.credits,
-      qoder_model: model
+      qoder_model: model,
+      qoder_context_ratio: ratio,
+      qoder_duration_ms: outcome.durationMs ?? null,
+      qoder_tokens_estimated: true
     };
 
     // ── 思考链的字段名 ────────────────────────────────────────────────
