@@ -401,6 +401,81 @@ const MAX_TOOL_PROMPT_CHARS = 24000;
 const MAX_TOOL_DESC_CHARS = 400;
 const MAX_TOOL_PARAM_DESC_CHARS = 120;
 
+// ---------------------------------------------------------------------------
+// DSML 兼容层（DeepSeek 系模型的"母语"）
+//
+// 有些模型（DeepSeek-V4/Flash、部分 Qwen）会用自己的原生工具调用标记：两个全角
+// 竖线 U+FF5C 夹住 DSML 字样，后面跟 invoke / parameter 之类的标签，例如
+//   <mark> calls / <mark> invoke name="run_code" / <mark> parameter name="code"
+// 其中 <mark> 表示「两个全角竖线 + DSML + 两个全角竖线」。
+//
+// 危害在于自我强化：模型一旦这样输出一次，我们认不出 → 整段当正文发给 DSH →
+// DSH 把它记进助手历史 → 下一轮历史喂回去，模型看到"我上次就是这么调的"，
+// 继续用 DSML。几轮之后再也回不到约定格式，表现就是"只会思考、不动手"。
+//
+// 两道防线：
+//   1. flattenMessages() 把历史里的 DSML 重写成约定格式，断掉雪球（治本）。
+//   2. createToolCallExtractor() 也认 DSML，兜住当轮万一还是老格式（治标）。
+const DSML_MARK = String.fromCharCode(0xFF5C, 0xFF5C) + 'DSML' + String.fromCharCode(0xFF5C, 0xFF5C);
+const DSML_CALL_OPEN = DSML_MARK + ' invoke';
+const DSML_CALL_CLOSE = DSML_MARK + ' /invoke';
+
+/** 一段 DSML 文本 -> 一组 {name, arguments(JSON 字符串)}。识别不出返回空数组。 */
+function parseDsmlBlock(text) {
+  const out = [];
+  let cur = null;
+  for (const seg of String(text).split(DSML_MARK)) {
+    // 不要求标记段一定带 '>'：真实输出里 calls / invoke 这两个标记常常只跟一个换行。
+    const gt = seg.indexOf('>');
+    const head = (gt >= 0 ? seg.slice(0, gt) : seg).trim();
+    const body = gt >= 0 ? seg.slice(gt + 1).replace(/[ \t\r\n]+$/, '') : '';
+
+    if (head.startsWith('invoke')) {
+      if (cur && cur.name) out.push({ name: cur.name, arguments: JSON.stringify(cur.args) });
+      const m = /name\s*=\s*"([^"]*)"/.exec(head);
+      cur = { name: m ? m[1] : '', args: {} };
+      continue;
+    }
+    if (head.startsWith('parameter')) {
+      if (cur) {
+        const m = /name\s*=\s*"([^"]*)"/.exec(head);
+        const isString = /string\s*=\s*"true"/.test(head);
+        if (m && m[1]) cur.args[m[1]] = isString ? body : (tryParseJson(body.trim()) ?? body.trim());
+      }
+      continue;
+    }
+    // /invoke、/calls、calls 之类：收尾当前调用
+    if (head.startsWith('/') || head.startsWith('calls')) {
+      if (cur && cur.name) out.push({ name: cur.name, arguments: JSON.stringify(cur.args) });
+      cur = null;
+    }
+  }
+  if (cur && cur.name) out.push({ name: cur.name, arguments: JSON.stringify(cur.args) });
+  return out;
+}
+
+/** 清洗历史：把 DSML 片段改写成约定格式，其他文字原样保留。 */
+function rewriteDsml(text) {
+  const s = String(text);
+  if (!s.includes(DSML_MARK)) return s;
+  const calls = parseDsmlBlock(s);
+  if (!calls.length) return s;
+  const rendered = calls.map((c) =>
+    TOOL_OPEN + JSON.stringify({ name: c.name, arguments: tryParseJson(c.arguments) ?? {} }) + TOOL_CLOSE
+  ).join('\n');
+  // 去掉原文里的 DSML 片段，留下非 DSML 的叙述文字
+  const rest = s.split(DSML_MARK).map((seg, i) => {
+    if (i === 0) return seg;
+    const gt = seg.indexOf('>');
+    const head = (gt >= 0 ? seg.slice(0, gt) : seg).trim();
+    // parameter / invoke 段后面跟的是参数值，不是叙述文字，丢掉
+    if (head.startsWith('parameter') || head.startsWith('invoke')) return '';
+    return gt >= 0 ? seg.slice(gt + 1) : '';
+  }).join(' ').replace(/\s+/g, ' ').trim();
+  return (rest ? rest + '\n' : '') + rendered;
+}
+
+
 function tryParseJson(s) {
   if (typeof s !== 'string' || !s) return null;
   try { return JSON.parse(s); } catch {}
@@ -451,6 +526,8 @@ function buildToolSystemPrompt(tools, toolChoice) {
     '宿主会执行该调用，并把结果作为下一条 Tool result 消息回给你，你收到后再继续推理。',
     '可以直接回答时用自然语言回答，不要输出 ' + TOOL_OPEN + '。',
     '一次只调用一个工具，arguments 必须是合法 JSON 对象。',
+    '不要使用任何其他工具调用格式 —— 例如用全角竖线包起来的 DSML 标记、或任何 XML 风格的',
+    'invoke/parameter 标签。那些格式不会被识别，只会被当成普通文字显示给用户。',
   ];
 
   const forced = toolChoice && typeof toolChoice === 'object' ? toolChoice.function?.name : null;
@@ -519,7 +596,7 @@ function parseToolCall(raw) {
  */
 function createToolCallExtractor({ onText, onToolCall }) {
   let tail = '';       // 扣住的半截标签
-  let inBlock = false;
+  let open = null;     // 当前所处的块（null = 文本态）
   let body = '';
   let hold = '';       // 尾部未定空白
   let textOut = '';
@@ -527,23 +604,41 @@ function createToolCallExtractor({ onText, onToolCall }) {
   const seen = new Set();
 
   const pushText = (s) => { if (!s) return; textOut += s; onText(s); };
+  const pushClean = (s) => pushText(cleanup(s));
 
   const emitWithheld = (s) => {
     const merged = hold + s;
     const m = /[ \t\r\n]*$/.exec(merged);
     hold = m ? m[0] : '';
     const head = merged.slice(0, merged.length - hold.length);
-    if (head) pushText(head);
+    if (head) pushText(cleanup(head));
   };
 
-  const emitCall = (raw) => {
-    const call = parseToolCall(raw);
-    if (!call) return;
-    const sig = call.name + '\u0000' + call.arguments;
-    if (seen.has(sig)) return;
-    seen.add(sig);
-    calls.push(call);
-    onToolCall(call);
+  // 两种开始/结束标记：约定格式，以及模型可能自发使用的 DSML 格式。
+  const OPENERS = [
+    { mark: TOOL_OPEN, close: TOOL_CLOSE, kind: 'tag' },
+    { mark: DSML_CALL_OPEN, close: DSML_CALL_CLOSE, kind: 'dsml' }
+  ];
+  /** 把文本里孤立的 DSML 标记片段（/calls、/DSML 之类）抹掉，只留其后的正文。 */
+  const cleanup = (s) => {
+    if (!s || s.indexOf(DSML_MARK) < 0) return s;
+    return s.split(DSML_MARK).map((seg, i) => {
+      if (i === 0) return seg;
+      const gt = seg.indexOf('>');
+      return gt >= 0 ? seg.slice(gt + 1) : '';
+    }).join('');
+  };
+
+  const emitCall = (raw, kind) => {
+    const list = kind === 'dsml' ? parseDsmlBlock(raw) : [parseToolCall(raw)];
+    for (const call of list) {
+      if (!call || !call.name) continue;
+      const sig = call.name + '\u0000' + call.arguments;
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      calls.push(call);
+      onToolCall(call);
+    }
   };
 
   const feed = (chunk) => {
@@ -552,29 +647,42 @@ function createToolCallExtractor({ onText, onToolCall }) {
     tail = '';
     for (;;) {
       if (!s) return;
-      if (inBlock) {
-        const idx = s.indexOf(TOOL_CLOSE);
+      if (open) {
+        const idx = s.indexOf(open.close);
         if (idx < 0) { body += s; return; }
         body += s.slice(0, idx);
-        s = s.slice(idx + TOOL_CLOSE.length);
-        inBlock = false;
+        s = s.slice(idx + open.close.length);
         const raw = body;
+        const kind = open.kind;
         body = '';
-        emitCall(raw);
+        open = null;
+        emitCall(raw, kind);
         continue;
       }
-      const idx = s.indexOf(TOOL_OPEN);
-      if (idx >= 0) {
-        emitWithheld(s.slice(0, idx));
+      // 文本态：两种开始标记里取更早出现的那个
+      let hit = null;
+      for (const o of OPENERS) {
+        const i = s.indexOf(o.mark);
+        if (i >= 0 && (!hit || i < hit.idx)) hit = { idx: i, o };
+      }
+      if (hit) {
+        emitWithheld(s.slice(0, hit.idx));
         hold = '';
-        s = s.slice(idx + TOOL_OPEN.length);
-        inBlock = true;
+        s = s.slice(hit.idx + hit.o.mark.length);
+        open = hit.o;
+        // 标记本身还给 body —— DSML 解析器要靠它分段
+        body = hit.o.kind === 'dsml' ? hit.o.mark : '';
         continue;
       }
+      // 尾部可能被分片切在标记中间，先扣住；DSML_MARK 本身也算候选，
+      // 否则孤立的 /calls 之类会被当成正文漏出去。
       let keep = 0;
-      const max = Math.min(TOOL_OPEN.length - 1, s.length);
-      for (let n = max; n > 0; n--) {
-        if (s.endsWith(TOOL_OPEN.slice(0, n))) { keep = n; break; }
+      const cands = OPENERS.map((o) => o.mark).concat([DSML_MARK]);
+      for (const mark of cands) {
+        const max = Math.min(mark.length - 1, s.length);
+        for (let n = max; n > 0; n--) {
+          if (s.endsWith(mark.slice(0, n))) { if (n > keep) keep = n; break; }
+        }
       }
       emitWithheld(s.slice(0, s.length - keep));
       tail = keep ? s.slice(s.length - keep) : '';
@@ -583,11 +691,12 @@ function createToolCallExtractor({ onText, onToolCall }) {
   };
 
   const flush = () => {
-    if (inBlock) {
+    if (open) {
       const raw = body;
+      const kind = open.kind;
       body = '';
-      inBlock = false;
-      if (raw.trim()) emitCall(raw);   // 流被截断：尽力解析已攒到的内容
+      open = null;
+      if (raw.trim()) emitCall(raw, kind);   // 流被截断：尽力解析已攒到的内容
     }
     if (tail) { emitWithheld(tail); tail = ''; }
     if (hold) { pushText(hold); hold = ''; }
@@ -663,7 +772,7 @@ function flattenMessages(messages, systemFromField) {
 
     if (role === 'assistant') {
       const parts = [];
-      if (text) parts.push(text);
+      if (text) parts.push(rewriteDsml(text));
       if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
         const rendered = renderToolCalls(m.tool_calls);
         if (rendered) parts.push(rendered);
